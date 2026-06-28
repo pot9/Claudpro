@@ -224,9 +224,13 @@ async function fetchTrades(wallet, cutoff, proxy){
   const limit = 500;
   let offset = 0, all = [], guard = 0;
   while(guard++ < 60){
-    const url = `${API_BASE}/trades?user=${wallet}&limit=${limit}&offset=${offset}&takerOnly=false`;
+    const url = `${API_BASE}/trades?user=${wallet}&limit=${limit}&offset=${offset}`;
     const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-    if(!res.ok) throw new Error(`API returned HTTP ${res.status}`);
+    if(!res.ok){
+      let body = "";
+      try { body = (await res.text()).trim(); } catch(e){}
+      throw new Error(`API returned HTTP ${res.status}${body ? " — " + body.slice(0,200) : ""}`);
+    }
     let batch = await res.json();
     if(!Array.isArray(batch)){ batch = batch && batch.data ? batch.data : []; }
     if(batch.length === 0) break;

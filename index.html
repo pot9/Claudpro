@@ -158,7 +158,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 5</span>
+    <br><span style="opacity:.6">version 6</span>
   </div>
 </div>
 
@@ -350,26 +350,31 @@ const parseArr = s => { try { return typeof s === "string" ? JSON.parse(s) : (s 
 
 async function fetchMarketPrices(conditionIds, proxy){
   const map = {};
+  let priced = 0;
   const ids = [...new Set(conditionIds)].filter(Boolean);
   const CHUNK = 20;
+  // Gamma's `closed` param defaults to false (hides resolved markets), so we query
+  // BOTH open and resolved and merge, preferring the resolved (settled) record.
+  const grab = async (chunk, closedFlag) => {
+    const qs = chunk.map(id => `condition_ids=${encodeURIComponent(id)}`).join("&");
+    const url = `https://gamma-api.polymarket.com/markets?${qs}&limit=${chunk.length}&closed=${closedFlag}`;
+    const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
+    if(!res.ok) return;
+    let arr = await res.json();
+    if(!Array.isArray(arr)) arr = arr && arr.data ? arr.data : [];
+    for(const m of arr){
+      const closed = !!(m.closed || m.umaResolutionStatus === "resolved");
+      if(map[m.conditionId] && map[m.conditionId].closed && !closed) continue;  // keep settled record
+      if(!map[m.conditionId]) priced++;
+      map[m.conditionId] = { closed, prices: parseArr(m.outcomePrices), tokens: parseArr(m.clobTokenIds) };
+    }
+  };
   for(let i = 0; i < ids.length; i += CHUNK){
     const chunk = ids.slice(i, i + CHUNK);
-    const qs = chunk.map(id => `condition_ids=${encodeURIComponent(id)}`).join("&");
-    const url = `https://gamma-api.polymarket.com/markets?${qs}&limit=${chunk.length}`;
-    try{
-      const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-      if(!res.ok) continue;
-      let arr = await res.json();
-      if(!Array.isArray(arr)) arr = arr && arr.data ? arr.data : [];
-      for(const m of arr){
-        map[m.conditionId] = {
-          closed: !!(m.closed || m.umaResolutionStatus === "resolved"),
-          prices: parseArr(m.outcomePrices),
-          tokens: parseArr(m.clobTokenIds)
-        };
-      }
-    }catch(e){ /* leave unmapped — falls back to last traded price */ }
+    try { await grab(chunk, "true"); }  catch(e){ /* ignore */ }
+    try { await grab(chunk, "false"); } catch(e){ /* ignore */ }
   }
+  map.__priced = priced; map.__requested = ids.length;
   return map;
 }
 
@@ -424,7 +429,7 @@ function finalize(sim, p, marketMap){
     fees: sim.fees, slip: sim.slip, costDrag: sim.fees + sim.slip,
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
-    maxDD, fallback,
+    maxDD, fallback, marketsPriced: marketMap.__priced || 0, marketsRequested: marketMap.__requested || 0,
     positions: positions.sort((a,b)=> b.pnl - a.pnl),
     log: sim.log.slice().reverse(), curve
   };
@@ -477,9 +482,13 @@ function render(r){
     </tr>`).join("");
 
   const parts = [];
+  if(r.marketsRequested && r.marketsPriced === 0)
+    parts.push("⚠️ Couldn't reach the market-resolution API (Gamma) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
+  else if(r.marketsRequested)
+    parts.push(`Priced ${r.marketsPriced} of ${r.marketsRequested} held markets from the market API.`);
   if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
   if(r.openCount) parts.push(`${r.openCount} market(s) still open (not yet resolved) — their P&L is an estimate at the live price and is excluded from win rate.`);
-  if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced from the market API, so they're valued at the last traded price.`);
+  if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced individually, so they're valued at the last traded price.`);
   if(r.skipped) parts.push(`${r.skipped} trade(s) skipped (insufficient cash).`);
   if(r.capped) parts.push(`${r.capped} buy(s) partially filled (cash-capped).`);
   parts.push("Win rate, avg win/loss, profit factor and expectancy are computed over decided markets only (sold or resolved).");

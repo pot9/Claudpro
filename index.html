@@ -52,6 +52,8 @@
   .tag{font-size:10px;padding:1px 6px;border-radius:6px;font-weight:600}
   .tBUY{background:rgba(52,211,153,.15);color:var(--good)}
   .tSELL{background:rgba(248,113,113,.15);color:var(--bad)}
+  .tWIN{background:rgba(52,211,153,.18);color:var(--good)}
+  .tOPEN{background:rgba(251,191,36,.16);color:var(--warn)}
   .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .hidden{display:none}
   .note{font-size:11px;color:var(--muted);margin-top:10px;line-height:1.4}
@@ -141,7 +143,7 @@
     </div>
 
     <div class="card" id="openCard">
-      <div class="secttitle">Still-open positions (marked at last seen price)</div>
+      <div class="secttitle">Per-market results — every position you copied (In = put in, Out$ = got back)</div>
       <div class="scroll"><table id="openTbl"></table></div>
     </div>
 
@@ -156,7 +158,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 4</span>
+    <br><span style="opacity:.6">version 5</span>
   </div>
 </div>
 
@@ -203,7 +205,11 @@ async function run(){
     }
     const who = (trades.find(t => t.trader) || {}).trader;
     setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Running simulation…`);
-    const res = simulate(trades, params);
+    const sim = simulate(trades, params);
+    setStatus("Checking how each market resolved…");
+    const condIds = sim.positions.filter(ps => ps.shares > 1e-6).map(ps => ps.conditionId);
+    const marketMap = await fetchMarketPrices(condIds, params.proxy);
+    const res = finalize(sim, params, marketMap);
     res.truncated = truncated;
     render(res, params);
     const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
@@ -263,6 +269,8 @@ function normalize(t){
     ts: num(t.timestamp || t.time || 0),
     side,
     asset: String(t.asset || t.tokenId || t.token_id || ""),
+    conditionId: String(t.conditionId || t.condition_id || ""),
+    outcomeIndex: t.outcomeIndex != null ? num(t.outcomeIndex) : (t.outcome_index != null ? num(t.outcome_index) : 0),
     price: num(t.price),
     size: num(t.size || t.shares || t.amount || 0),
     title: t.title || t.market || t.eventSlug || t.slug || "market",
@@ -271,12 +279,11 @@ function normalize(t){
   };
 }
 
-// ---- Simulation ----
+// ---- Simulation: replay his trades, copy each one ----
 function simulate(trades, p){
-  let cash = p.bankroll, realized = 0, copied = 0, skipped = 0, capped = 0;
-  let wins = 0, sells = 0;
-  const pos = {};        // asset -> {shares, basis, last, title, outcome}
-  const traderShares = {}; // asset -> running trader shares
+  let cash = p.bankroll, copied = 0, skipped = 0, capped = 0, fees = 0, slip = 0;
+  const pos = {};          // asset -> position object
+  const traderShares = {}; // asset -> running trader share count (to mirror exit fractions)
   const curve = [{ts: trades[0].ts - 1, equity: p.bankroll}];
   const log = [];
 
@@ -288,8 +295,11 @@ function simulate(trades, p){
 
   for(const tr of trades){
     const a = tr.asset;
-    if(!pos[a]) pos[a] = {shares:0, basis:0, last:tr.price, title:tr.title, outcome:tr.outcome};
-    pos[a].last = tr.price;
+    if(!pos[a]) pos[a] = {asset:a, conditionId:tr.conditionId, outcomeIndex:tr.outcomeIndex,
+      title:tr.title, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
+      invested:0, returned:0, bought:0, buys:0, sells:0};
+    const ps = pos[a];
+    ps.last = tr.price;
 
     if(tr.side === "BUY"){
       const fill = clampPrice(tr.price * (1 + p.slip));
@@ -300,71 +310,123 @@ function simulate(trades, p){
           skipped++; traderShares[a] = (traderShares[a]||0) + tr.size;
           curve.push({ts:tr.ts, equity:markEquity()}); continue;
         }
-        // partial fill with available cash (price + fee on price)
-        shares = cash / (fill * (1 + p.fee));
+        shares = cash / (fill * (1 + p.fee));   // partial fill with the cash we have
         cost = shares * fill; fee = cost * p.fee; capped++;
       }
       cash -= cost + fee;
-      pos[a].shares += shares; pos[a].basis += cost + fee;
+      ps.shares += shares; ps.basis += cost + fee; ps.invested += cost + fee; ps.bought += shares; ps.buys++;
+      fees += fee; slip += shares * (fill - tr.price);
       traderShares[a] = (traderShares[a]||0) + tr.size;
       copied++;
-      log.push({ts:tr.ts, side:"BUY", title:tr.title, outcome:tr.outcome,
-                shares, price:fill, value:cost+fee});
-    } else { // SELL
+      log.push({ts:tr.ts, side:"BUY", title:tr.title, outcome:tr.outcome, shares, price:fill, value:cost+fee});
+    } else { // SELL — mirror the fraction of the position he is closing
       const before = traderShares[a] || 0;
-      const have = pos[a].shares;
+      const have = ps.shares;
       if(have <= 1e-9){
         traderShares[a] = Math.max(0, before - tr.size);
         curve.push({ts:tr.ts, equity:markEquity()}); continue;
       }
-      let sellShares;
-      if(before > 1e-9){
-        const frac = Math.min(1, tr.size / before);   // mirror his exit fraction
-        sellShares = have * frac;
-      } else {
-        sellShares = Math.min(have, tr.size * p.ratio);
-      }
+      const sellShares = before > 1e-9 ? have * Math.min(1, tr.size/before) : Math.min(have, tr.size * p.ratio);
       const fill = clampPrice(tr.price * (1 - p.slip));
       const proceeds = sellShares * fill, fee = proceeds * p.fee;
-      const costPortion = pos[a].basis * (sellShares / have);
-      const pnl = (proceeds - fee) - costPortion;
-      realized += pnl; cash += proceeds - fee;
-      pos[a].shares -= sellShares; pos[a].basis -= costPortion;
+      const costPortion = ps.basis * (sellShares / have);
+      cash += proceeds - fee;
+      ps.shares -= sellShares; ps.basis -= costPortion; ps.returned += proceeds - fee; ps.sells++;
+      fees += fee; slip += sellShares * (tr.price - fill);
       traderShares[a] = Math.max(0, before - tr.size);
-      sells++; if(pnl > 0) wins++; copied++;
+      copied++;
       log.push({ts:tr.ts, side:"SELL", title:tr.title, outcome:tr.outcome,
-                shares:sellShares, price:fill, value:proceeds - fee, pnl});
+                shares:sellShares, price:fill, value:proceeds - fee, pnl:(proceeds-fee)-costPortion});
     }
     curve.push({ts:tr.ts, equity:markEquity()});
   }
 
-  // close out valuation
-  let openValue = 0, unrealized = 0;
-  const open = [];
-  for(const a in pos){
-    const ps = pos[a];
-    if(ps.shares > 1e-6){
-      const mv = ps.shares * ps.last;
-      openValue += mv; unrealized += mv - ps.basis;
-      open.push({title:ps.title, outcome:ps.outcome, shares:ps.shares,
-                 price:ps.last, value:mv, pnl:mv - ps.basis});
-    }
-  }
-  const endingEquity = cash + openValue;
+  return { startBankroll:p.bankroll, cash, positions:Object.values(pos),
+           curve, log, copied, skipped, capped, fees, slip };
+}
 
-  // max drawdown on equity curve
-  let peak = -Infinity, maxDD = 0;
-  for(const c of curve){
-    if(c.equity > peak) peak = c.equity;
-    if(peak > 0) maxDD = Math.max(maxDD, (peak - c.equity)/peak);
+// ---- Look up each market's resolution / live price (Gamma API) ----
+const parseArr = s => { try { return typeof s === "string" ? JSON.parse(s) : (s || []); } catch(e){ return []; } };
+
+async function fetchMarketPrices(conditionIds, proxy){
+  const map = {};
+  const ids = [...new Set(conditionIds)].filter(Boolean);
+  const CHUNK = 20;
+  for(let i = 0; i < ids.length; i += CHUNK){
+    const chunk = ids.slice(i, i + CHUNK);
+    const qs = chunk.map(id => `condition_ids=${encodeURIComponent(id)}`).join("&");
+    const url = `https://gamma-api.polymarket.com/markets?${qs}&limit=${chunk.length}`;
+    try{
+      const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
+      if(!res.ok) continue;
+      let arr = await res.json();
+      if(!Array.isArray(arr)) arr = arr && arr.data ? arr.data : [];
+      for(const m of arr){
+        map[m.conditionId] = {
+          closed: !!(m.closed || m.umaResolutionStatus === "resolved"),
+          prices: parseArr(m.outcomePrices),
+          tokens: parseArr(m.clobTokenIds)
+        };
+      }
+    }catch(e){ /* leave unmapped — falls back to last traded price */ }
   }
+  return map;
+}
+
+// ---- Finalize: value open positions at resolution/live price, compute metrics ----
+function finalize(sim, p, marketMap){
+  let cash = sim.cash, openValue = 0, fallback = 0;
+  const positions = [];
+  for(const ps of sim.positions){
+    if(ps.invested <= 1e-9) continue;        // we never actually took this position
+    let finalPrice = ps.last, resolved = false, marked = "last-trade";
+    const m = marketMap[ps.conditionId];
+    if(m && m.prices && m.prices.length){
+      let idx = m.tokens && m.tokens.length ? m.tokens.indexOf(ps.asset) : -1;
+      if(idx < 0) idx = ps.outcomeIndex;
+      const pr = parseFloat(m.prices[idx]);
+      if(isFinite(pr)){ finalPrice = pr; resolved = m.closed; marked = resolved ? "resolved" : "live"; }
+    }
+    const holding = ps.shares > 1e-6;
+    const finalValue = holding ? ps.shares * finalPrice : 0;
+    if(holding){ openValue += finalValue; if(marked === "last-trade") fallback++; }
+    const pnl = ps.returned + finalValue - ps.invested;
+    // status: closed (fully sold), resolved (held to settlement), or open (still live)
+    const status = !holding ? "closed" : (resolved ? "resolved" : "open");
+    const decided = status !== "open";       // only decided positions count toward win/loss
+    positions.push({ title:ps.title, outcome:ps.outcome, status, decided,
+      shares:ps.shares, invested:ps.invested, out: ps.returned + finalValue,
+      finalPrice, finalValue, pnl,
+      avgEntry: ps.bought > 1e-9 ? ps.invested / ps.bought : finalPrice });
+  }
+
+  const endingEquity = cash + openValue;
+  const decided = positions.filter(x => x.decided);
+  const winners = decided.filter(x => x.pnl > 0);
+  const losers  = decided.filter(x => x.pnl < 0);
+  const grossProfit = winners.reduce((s,x)=>s+x.pnl, 0);
+  const grossLoss   = Math.abs(losers.reduce((s,x)=>s+x.pnl, 0));
+  const winRate = decided.length ? winners.length / decided.length : null;
+  const avgWin  = winners.length ? grossProfit / winners.length : 0;
+  const avgLoss = losers.length  ? grossLoss / losers.length : 0;
+  const profitFactor = grossLoss > 1e-9 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
+  const expectancy = decided.length ? (grossProfit - grossLoss) / decided.length : 0;
+
+  // max drawdown over the equity curve, with a final settled point appended
+  const curve = sim.curve.concat([{ ts: sim.curve[sim.curve.length-1].ts + 1, equity: endingEquity }]);
+  let peak = -Infinity, maxDD = 0;
+  for(const c of curve){ if(c.equity > peak) peak = c.equity; if(peak > 0) maxDD = Math.max(maxDD, (peak - c.equity)/peak); }
 
   return {
-    startBankroll: p.bankroll, endingEquity, cash, openValue,
-    realized, unrealized, totalReturn: (endingEquity - p.bankroll)/p.bankroll,
-    copied, skipped, capped, sells, wins, maxDD,
-    open: open.sort((x,y)=>y.value-x.value),
-    log: log.slice().reverse(), curve
+    startBankroll: sim.startBankroll, endingEquity, cash, openValue,
+    netPnl: endingEquity - sim.startBankroll, roi: (endingEquity - sim.startBankroll)/sim.startBankroll,
+    copied: sim.copied, skipped: sim.skipped, capped: sim.capped,
+    fees: sim.fees, slip: sim.slip, costDrag: sim.fees + sim.slip,
+    positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
+    wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
+    maxDD, fallback,
+    positions: positions.sort((a,b)=> b.pnl - a.pnl),
+    log: sim.log.slice().reverse(), curve
   };
 }
 
@@ -372,32 +434,38 @@ function simulate(trades, p){
 function render(r){
   $("results").classList.remove("hidden");
   const cls = n => n>=0 ? "pos" : "neg";
-  const winRate = r.sells ? (r.wins/r.sells*100).toFixed(0)+"%" : "—";
+  const pf = r.profitFactor === Infinity ? "∞" : r.profitFactor.toFixed(2);
+  const wr = r.winRate == null ? "—" : (r.winRate*100).toFixed(0)+"%";
   $("kpis").innerHTML = `
-    ${kpi("Total return", fmtPct(r.totalReturn), cls(r.totalReturn))}
-    ${kpi("Ending equity", fmtUSD(r.endingEquity), cls(r.endingEquity-r.startBankroll))}
-    ${kpi("Realized P&L", fmtUSD(r.realized), cls(r.realized))}
-    ${kpi("Open (unrealized)", fmtUSD(r.unrealized), cls(r.unrealized))}
-    ${kpi("Free cash", fmtUSD(r.cash), "")}
+    ${kpi("Net profit / loss", fmtUSD(r.netPnl), cls(r.netPnl))}
+    ${kpi("Return on bankroll", fmtPct(r.roi), cls(r.roi))}
+    ${kpi("Win rate", wr, "")}
+    ${kpi("Wins / Losses", r.wins + " / " + r.losses, "")}
+    ${kpi("Avg win", fmtUSD(r.avgWin), "pos")}
+    ${kpi("Avg loss", fmtUSD(-r.avgLoss), "neg")}
+    ${kpi("Profit factor", pf, cls((r.profitFactor||0)-1))}
+    ${kpi("Expectancy / trade", fmtUSD(r.expectancy), cls(r.expectancy))}
+    ${kpi("Markets traded", String(r.positionsTraded), "")}
     ${kpi("Max drawdown", "-"+(r.maxDD*100).toFixed(1)+"%", "neg")}
-    ${kpi("Trades copied", String(r.copied), "")}
-    ${kpi("Sell win rate", winRate, "")}
+    ${kpi("Fees + slippage", fmtUSD(r.costDrag), "neg")}
+    ${kpi("Ending bankroll", fmtUSD(r.endingEquity), cls(r.netPnl))}
   `;
   drawChart(r.curve);
 
-  // open positions
-  if(r.open.length){
-    $("openCard").classList.remove("hidden");
-    $("openTbl").innerHTML =
-      "<tr><th>Market</th><th>Out</th><th>Shares</th><th>Px</th><th>Value</th><th>P&L</th></tr>" +
-      r.open.map(o => `<tr><td class="mkt">${esc(o.title)}</td><td>${esc(o.outcome)}</td>
-        <td>${o.shares.toFixed(1)}</td><td>${o.price.toFixed(3)}</td>
-        <td>${fmtUSD(o.value)}</td><td class="${cls(o.pnl)}">${fmtUSD(o.pnl)}</td></tr>`).join("");
-  } else {
-    $("openCard").classList.add("hidden");
-  }
+  // per-market results (the positions you copied)
+  const badge = s => s==="resolved" ? `<span class="tag tWIN">settled</span>`
+    : s==="closed" ? `<span class="tag tSELL">sold</span>`
+    : `<span class="tag tOPEN">open</span>`;
+  $("openTbl").innerHTML =
+    "<tr><th>Market</th><th>Out</th><th>Status</th><th>In</th><th>Out$</th><th>P&L</th></tr>" +
+    r.positions.slice(0,300).map(o => `<tr>
+      <td class="mkt">${esc(o.title)}</td><td>${esc(o.outcome)}</td>
+      <td>${badge(o.status)}</td>
+      <td>${fmtUSD(o.invested)}</td>
+      <td>${fmtUSD(o.out)}</td>
+      <td class="${cls(o.pnl)}">${fmtUSD(o.pnl)}</td></tr>`).join("");
 
-  // trade log
+  // per-fill trade log
   $("logTbl").innerHTML =
     "<tr><th>Date</th><th>Side</th><th>Market</th><th>Shares</th><th>Px</th><th>P&L</th></tr>" +
     r.log.slice(0,300).map(l => `<tr>
@@ -410,9 +478,11 @@ function render(r){
 
   const parts = [];
   if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
+  if(r.openCount) parts.push(`${r.openCount} market(s) still open (not yet resolved) — their P&L is an estimate at the live price and is excluded from win rate.`);
+  if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced from the market API, so they're valued at the last traded price.`);
   if(r.skipped) parts.push(`${r.skipped} trade(s) skipped (insufficient cash).`);
   if(r.capped) parts.push(`${r.capped} buy(s) partially filled (cash-capped).`);
-  parts.push("Open positions are marked at the last price seen in the window, not at final market resolution — treat unrealized P&L as an estimate.");
+  parts.push("Win rate, avg win/loss, profit factor and expectancy are computed over decided markets only (sold or resolved).");
   $("caveats").innerHTML = parts.join(" ");
 }
 

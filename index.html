@@ -195,7 +195,7 @@ async function run(){
   setStatus("Fetching trades…");
   try{
     const cutoff = Math.floor(Date.now()/1000) - params.days*86400;
-    const trades = await fetchTrades(wallet, cutoff, params.proxy);
+    const { trades, truncated } = await fetchTrades(wallet, cutoff, params.proxy);
     if(trades.length === 0){
       setStatus("No trades found for this wallet in the selected window.", true);
       $("run").disabled = false; return;
@@ -203,8 +203,10 @@ async function run(){
     const who = (trades.find(t => t.trader) || {}).trader;
     setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Running simulation…`);
     const res = simulate(trades, params);
+    res.truncated = truncated;
     render(res, params);
-    setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.`);
+    const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
+    setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.${note}`);
   }catch(e){
     console.error(e);
     setStatus("Error: " + e.message + (params.proxy ? "" :
@@ -222,8 +224,10 @@ function setStatus(msg, isErr){
 // ---- Data ----
 async function fetchTrades(wallet, cutoff, proxy){
   const limit = 500;
-  let offset = 0, all = [], guard = 0;
+  const MAX_OFFSET = 3000;       // API hard cap: can't page past the most recent 3000 trades
+  let offset = 0, all = [], guard = 0, reachedCutoff = false, truncated = false;
   while(guard++ < 60){
+    if(offset >= MAX_OFFSET){ truncated = true; break; }
     const url = `${API_BASE}/trades?user=${wallet}&limit=${limit}&offset=${offset}`;
     const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
     if(!res.ok){
@@ -237,12 +241,14 @@ async function fetchTrades(wallet, cutoff, proxy){
     all.push(...batch);
     const oldest = num(batch[batch.length-1].timestamp);
     offset += batch.length;
-    if(oldest < cutoff) break;
+    if(oldest < cutoff){ reachedCutoff = true; break; }
     if(batch.length < limit) break;
   }
   // normalize + filter + sort ascending by time
-  return all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
-            .sort((a,b) => a.ts - b.ts);
+  const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
+                    .sort((a,b) => a.ts - b.ts);
+  // truncated only matters if we hit the cap without reaching the requested window start
+  return { trades, truncated: truncated && !reachedCutoff };
 }
 
 const num = v => typeof v === "number" ? v : parseFloat(v);
@@ -401,6 +407,7 @@ function render(r){
     </tr>`).join("");
 
   const parts = [];
+  if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
   if(r.skipped) parts.push(`${r.skipped} trade(s) skipped (insufficient cash).`);
   if(r.capped) parts.push(`${r.capped} buy(s) partially filled (cash-capped).`);
   parts.push("Open positions are marked at the last price seen in the window, not at final market resolution — treat unrealized P&L as an estimate.");

@@ -200,10 +200,11 @@ async function run(){
       setStatus("No trades found for this wallet in the selected window.", true);
       $("run").disabled = false; return;
     }
-    setStatus(`Loaded ${trades.length} trades. Running simulation…`);
+    const who = (trades.find(t => t.trader) || {}).trader;
+    setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Running simulation…`);
     const res = simulate(trades, params);
     render(res, params);
-    setStatus(`Done — replayed ${trades.length} of his trades, copied ${res.copied}.`);
+    setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.`);
   }catch(e){
     console.error(e);
     setStatus("Error: " + e.message + (params.proxy ? "" :
@@ -253,7 +254,8 @@ function normalize(t){
     price: num(t.price),
     size: num(t.size || t.shares || t.amount || 0),
     title: t.title || t.market || t.eventSlug || t.slug || "market",
-    outcome: t.outcome || (t.outcomeIndex != null ? "#" + t.outcomeIndex : "")
+    outcome: t.outcome || (t.outcomeIndex != null ? "#" + t.outcomeIndex : ""),
+    trader: t.name || t.pseudonym || ""
   };
 }
 

@@ -156,6 +156,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
+    <br><span style="opacity:.6">version 4</span>
   </div>
 </div>
 
@@ -228,7 +229,8 @@ async function fetchTrades(wallet, cutoff, proxy){
   let offset = 0, all = [], guard = 0, reachedCutoff = false, truncated = false;
   while(guard++ < 60){
     if(offset >= MAX_OFFSET){ truncated = true; break; }
-    const url = `${API_BASE}/trades?user=${wallet}&limit=${limit}&offset=${offset}`;
+    const reqLimit = Math.min(limit, MAX_OFFSET - offset);   // never let offset reach the 3000 cap
+    const url = `${API_BASE}/trades?user=${wallet}&limit=${reqLimit}&offset=${offset}`;
     const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
     if(!res.ok){
       let body = "";
@@ -242,7 +244,7 @@ async function fetchTrades(wallet, cutoff, proxy){
     const oldest = num(batch[batch.length-1].timestamp);
     offset += batch.length;
     if(oldest < cutoff){ reachedCutoff = true; break; }
-    if(batch.length < limit) break;
+    if(batch.length < reqLimit) break;
   }
   // normalize + filter + sort ascending by time
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)

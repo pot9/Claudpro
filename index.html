@@ -160,7 +160,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 12</span>
+    <br><span style="opacity:.6">version 13</span>
   </div>
 </div>
 
@@ -656,7 +656,7 @@ function drawChart(curve){
   ctx.beginPath(); ctx.moveTo(pad,gy(base)); ctx.lineTo(w-pad,gy(base)); ctx.stroke();
   ctx.setLineDash([]);
   // equity line
-  const up = ys[ys.length-1] >= base;
+  const up = curve[curve.length-1].equity >= base;
   ctx.strokeStyle = up ? "#34d399" : "#f87171"; ctx.lineWidth=2;
   ctx.beginPath();
   curve.forEach((c,i)=>{ const X=gx(c.ts),Y=gy(c.equity); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });

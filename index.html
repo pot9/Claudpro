@@ -158,7 +158,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 6</span>
+    <br><span style="opacity:.6">version 7</span>
   </div>
 </div>
 
@@ -229,33 +229,75 @@ function setStatus(msg, isErr){
 }
 
 // ---- Data ----
+// Primary: /activity supports start/end time filters, so we slice the window into
+// time chunks to get the FULL history past the 3000-offset cap. Falls back to /trades.
 async function fetchTrades(wallet, cutoff, proxy){
-  const limit = 500;
-  const MAX_OFFSET = 3000;       // API hard cap: can't page past the most recent 3000 trades
+  try{
+    const r = await fetchViaActivity(wallet, cutoff, proxy);
+    if(r.trades.length) return r;
+  }catch(e){ if(e.__http) throw e; /* otherwise fall back */ }
+  return await fetchViaTrades(wallet, cutoff, proxy);
+}
+
+async function getJSON(url, proxy){
+  const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
+  if(!res.ok){
+    let body = ""; try { body = (await res.text()).trim(); } catch(e){}
+    const err = new Error(`API returned HTTP ${res.status}${body ? " — " + body.slice(0,200) : ""}`);
+    err.__http = true; throw err;
+  }
+  let data = await res.json();
+  if(!Array.isArray(data)) data = data && data.data ? data.data : [];
+  return data;
+}
+
+async function fetchViaActivity(wallet, cutoff, proxy){
+  const limit = 500, MAX_OFFSET = 3000;
+  const all = [], seen = new Set();
+  let end = Math.floor(Date.now()/1000) + 1, truncated = false, slices = 0;
+  while(end > cutoff && slices++ < 300){
+    let offset = 0, oldest = end, hitCap = false;
+    while(true){
+      if(offset >= MAX_OFFSET){ hitCap = true; break; }
+      const reqLimit = Math.min(limit, MAX_OFFSET - offset);
+      const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${cutoff}&end=${end}`
+                + `&limit=${reqLimit}&offset=${offset}&sortDirection=DESC`;
+      const batch = await getJSON(url, proxy);
+      if(batch.length === 0) break;
+      for(const it of batch){
+        const ts = num(it.timestamp || it.time || 0);
+        if(ts < oldest) oldest = ts;
+        const key = (it.transactionHash||"") + "|" + (it.asset||"") + "|" + ts + "|" + (it.side||"") + "|" + (it.size||"");
+        if(!seen.has(key)){ seen.add(key); all.push(it); }
+      }
+      offset += batch.length;
+      if(batch.length < reqLimit) break;
+    }
+    if(hitCap && oldest < end) end = oldest;       // shrink window to the oldest we saw, keep going
+    else if(hitCap){ truncated = true; break; }    // can't make progress (>3000 in one instant)
+    else break;                                    // reached the start of the window
+  }
+  const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
+                    .sort((a,b) => a.ts - b.ts);
+  return { trades, truncated };
+}
+
+// Fallback: /trades (no time filter, capped at the most recent 3000)
+async function fetchViaTrades(wallet, cutoff, proxy){
+  const limit = 500, MAX_OFFSET = 3000;
   let offset = 0, all = [], guard = 0, reachedCutoff = false, truncated = false;
   while(guard++ < 60){
     if(offset >= MAX_OFFSET){ truncated = true; break; }
-    const reqLimit = Math.min(limit, MAX_OFFSET - offset);   // never let offset reach the 3000 cap
-    const url = `${API_BASE}/trades?user=${wallet}&limit=${reqLimit}&offset=${offset}`;
-    const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-    if(!res.ok){
-      let body = "";
-      try { body = (await res.text()).trim(); } catch(e){}
-      throw new Error(`API returned HTTP ${res.status}${body ? " — " + body.slice(0,200) : ""}`);
-    }
-    let batch = await res.json();
-    if(!Array.isArray(batch)){ batch = batch && batch.data ? batch.data : []; }
+    const reqLimit = Math.min(limit, MAX_OFFSET - offset);
+    const batch = await getJSON(`${API_BASE}/trades?user=${wallet}&limit=${reqLimit}&offset=${offset}`, proxy);
     if(batch.length === 0) break;
     all.push(...batch);
-    const oldest = num(batch[batch.length-1].timestamp);
     offset += batch.length;
-    if(oldest < cutoff){ reachedCutoff = true; break; }
+    if(num(batch[batch.length-1].timestamp) < cutoff){ reachedCutoff = true; break; }
     if(batch.length < reqLimit) break;
   }
-  // normalize + filter + sort ascending by time
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
-  // truncated only matters if we hit the cap without reaching the requested window start
   return { trades, truncated: truncated && !reachedCutoff };
 }
 

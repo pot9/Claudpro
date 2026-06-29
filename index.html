@@ -141,6 +141,7 @@
       <div class="kpis" id="kpis"></div>
       <canvas id="chart" width="700" height="200"></canvas>
       <div class="hint" style="text-align:center">Equity curve (USDC) over the look-back window</div>
+      <div class="note" id="benchmark"></div>
     </div>
 
     <div class="card" id="openCard">
@@ -159,7 +160,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 11</span>
+    <br><span style="opacity:.6">version 12</span>
   </div>
 </div>
 
@@ -212,6 +213,9 @@ async function run(){
     const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
     const res = finalize(sim, params, marketMap);
     res.truncated = truncated;
+    res.ratio = params.ratio;
+    res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
+    res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
     render(res, params);
     const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
     setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.${note}`);
@@ -529,6 +533,30 @@ function finalize(sim, p, marketMap){
   };
 }
 
+// Sum the P&L of every position in a sim (used for the trader benchmark).
+function sumPositionsPnl(sim, marketMap){
+  let pnl = 0;
+  for(const ps of sim.positions){
+    if(ps.invested <= 1e-9) continue;
+    let finalPrice = ps.last;
+    const m = marketMap[ps.conditionId];
+    if(m && m.prices && m.prices.length){
+      let idx = m.tokens && m.tokens.length ? m.tokens.indexOf(ps.asset) : -1;
+      if(idx < 0) idx = ps.outcomeIndex;
+      const pr = parseFloat(m.prices[idx]); if(isFinite(pr)) finalPrice = pr;
+    }
+    const finalValue = ps.shares > 1e-6 ? ps.shares * finalPrice : 0;
+    pnl += ps.returned + finalValue - ps.invested;
+  }
+  return pnl;
+}
+
+// The trader's own P&L on these same trades: full size (ratio 1), unlimited bankroll, no costs.
+function benchmarkTraderPnl(trades, marketMap){
+  const sim = simulate(trades, {bankroll: 1e15, ratio: 1, slip: 0, fee: 0, cashPolicy: "partial"}, marketMap);
+  return sumPositionsPnl(sim, marketMap);
+}
+
 // ---- Render ----
 function render(r){
   $("results").classList.remove("hidden");
@@ -548,8 +576,21 @@ function render(r){
     ${kpi("Max drawdown", "-"+(r.maxDD*100).toFixed(1)+"%", "neg")}
     ${kpi("Fees + slippage", fmtUSD(r.costDrag), "neg")}
     ${kpi("Ending bankroll", fmtUSD(r.endingEquity), cls(r.netPnl))}
+    ${kpi("Trader P&L (full size)", fmtUSD(r.traderPnl), cls(r.traderPnl))}
+    ${kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
   `;
   drawChart(r.curve);
+
+  // benchmark check: with no costs and no skipped trades, your P&L should equal his × ratio
+  const diff = r.netPnl - r.expectedPnl;
+  const close = Math.abs(diff) <= Math.max(0.5, Math.abs(r.expectedPnl)*0.02);
+  $("benchmark").innerHTML =
+    `<b>Check:</b> the trader made <b>${fmtUSD(r.traderPnl)}</b> on these trades at full size. ` +
+    `A perfect ×${r.ratio} copy with no costs = <b>${fmtUSD(r.expectedPnl)}</b>. ` +
+    `You got <b class="${cls(r.netPnl)}">${fmtUSD(r.netPnl)}</b>. ` +
+    (close
+      ? `✅ Matches — the copy is faithful.`
+      : `Difference of ${fmtUSD(diff)} comes from ${r.skipped?`${r.skipped} skipped buy(s) (cash-out), `:""}${r.costDrag>0.005?"fees/slippage, ":""}and sells you couldn't mirror. Raise the bankroll (or lower the ratio) and set fees/slippage to 0 to make it match exactly.`);
 
   // per-market results (the positions you copied)
   const badge = s => s==="resolved" ? `<span class="tag tWIN">settled</span>`

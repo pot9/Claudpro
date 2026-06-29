@@ -158,7 +158,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 7</span>
+    <br><span style="opacity:.6">version 8</span>
   </div>
 </div>
 
@@ -235,32 +235,44 @@ async function fetchTrades(wallet, cutoff, proxy){
   try{
     const r = await fetchViaActivity(wallet, cutoff, proxy);
     if(r.trades.length) return r;
-  }catch(e){ if(e.__http) throw e; /* otherwise fall back */ }
+  }catch(e){
+    if(/HTTP 400/.test(e.message)) throw e;   // real client error (e.g. bad wallet) — don't mask it
+    /* otherwise fall back to /trades below */
+  }
   return await fetchViaTrades(wallet, cutoff, proxy);
 }
 
-async function getJSON(url, proxy){
-  const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-  if(!res.ok){
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function getJSON(url, proxy, tries = 3){
+  for(let i = 0; i < tries; i++){
+    let res;
+    try { res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}}); }
+    catch(e){ if(i === tries-1) throw e; await sleep(700*(i+1)); continue; }   // network blip → retry
+    if(res.ok){
+      let data = await res.json();
+      if(!Array.isArray(data)) data = data && data.data ? data.data : [];
+      return data;
+    }
+    // transient server errors (timeout / 5xx) → wait and retry
+    if((res.status === 408 || res.status === 429 || res.status >= 500) && i < tries-1){ await sleep(900*(i+1)); continue; }
     let body = ""; try { body = (await res.text()).trim(); } catch(e){}
     const err = new Error(`API returned HTTP ${res.status}${body ? " — " + body.slice(0,200) : ""}`);
     err.__http = true; throw err;
   }
-  let data = await res.json();
-  if(!Array.isArray(data)) data = data && data.data ? data.data : [];
-  return data;
 }
 
 async function fetchViaActivity(wallet, cutoff, proxy){
-  const limit = 500, MAX_OFFSET = 3000;
+  const limit = 500, MAX_OFFSET = 3000, CHUNK = 7*86400;   // request 7 days at a time so the server doesn't time out
   const all = [], seen = new Set();
-  let end = Math.floor(Date.now()/1000) + 1, truncated = false, slices = 0;
-  while(end > cutoff && slices++ < 300){
+  let end = Math.floor(Date.now()/1000) + 1, truncated = false, guard = 0;
+  while(end > cutoff && guard++ < 2000){
+    const winStart = Math.max(cutoff, end - CHUNK);
     let offset = 0, oldest = end, hitCap = false;
     while(true){
       if(offset >= MAX_OFFSET){ hitCap = true; break; }
       const reqLimit = Math.min(limit, MAX_OFFSET - offset);
-      const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${cutoff}&end=${end}`
+      const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${winStart}&end=${end}`
                 + `&limit=${reqLimit}&offset=${offset}&sortDirection=DESC`;
       const batch = await getJSON(url, proxy);
       if(batch.length === 0) break;
@@ -273,9 +285,10 @@ async function fetchViaActivity(wallet, cutoff, proxy){
       offset += batch.length;
       if(batch.length < reqLimit) break;
     }
-    if(hitCap && oldest < end) end = oldest;       // shrink window to the oldest we saw, keep going
-    else if(hitCap){ truncated = true; break; }    // can't make progress (>3000 in one instant)
-    else break;                                    // reached the start of the window
+    if(hitCap && oldest < end) end = oldest;          // >3000 in this 7-day window → continue from the oldest seen
+    else if(hitCap){ truncated = true; break; }       // can't make progress (>3000 in one instant)
+    else end = winStart;                              // window done → step back to the previous 7 days
+    setStatus(`Fetching trades… ${all.length} so far`);
   }
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);

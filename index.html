@@ -54,6 +54,7 @@
   .tSELL{background:rgba(248,113,113,.15);color:var(--bad)}
   .tWIN{background:rgba(52,211,153,.18);color:var(--good)}
   .tOPEN{background:rgba(251,191,36,.16);color:var(--warn)}
+  .tRESOLVE{background:rgba(91,140,255,.16);color:var(--accent)}
   .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
   .hidden{display:none}
   .note{font-size:11px;color:var(--muted);margin-top:10px;line-height:1.4}
@@ -158,7 +159,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 9</span>
+    <br><span style="opacity:.6">version 10</span>
   </div>
 </div>
 
@@ -204,11 +205,11 @@ async function run(){
       $("run").disabled = false; return;
     }
     const who = (trades.find(t => t.trader) || {}).trader;
-    setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Running simulation…`);
-    const sim = simulate(trades, params);
-    setStatus("Checking how each market resolved…");
-    const condIds = sim.positions.filter(ps => ps.shares > 1e-6).map(ps => ps.conditionId);
+    setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Checking how each market resolved…`);
+    const condIds = [...new Set(trades.map(t => t.conditionId))];
     const marketMap = await fetchMarketPrices(condIds, params.proxy);
+    setStatus("Running simulation…");
+    const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
     const res = finalize(sim, params, marketMap);
     res.truncated = truncated;
     render(res, params);
@@ -335,20 +336,49 @@ function normalize(t){
 }
 
 // ---- Simulation: replay his trades, copy each one ----
-function simulate(trades, p){
-  let cash = p.bankroll, copied = 0, skipped = 0, capped = 0, fees = 0, slip = 0, noHold = 0;
+function simulate(trades, p, marketMap){
+  let cash = p.bankroll, copied = 0, skipped = 0, capped = 0, fees = 0, slip = 0, noHold = 0, settledCount = 0;
   const pos = {};          // asset -> position object
   const traderShares = {}; // asset -> running trader share count (to mirror exit fractions)
-  const curve = [{ts: trades[0].ts - 1, equity: p.bankroll}];
   const log = [];
 
+  // Build one timeline: his trades + each market's resolution "payday" (on its resolved date),
+  // so winnings flow back into cash and get reused for later trades — like real life.
+  const events = trades.map(t => Object.assign({_type:"TRADE"}, t));
+  if(marketMap){
+    for(const cond in marketMap){
+      if(cond.indexOf("__") === 0) continue;
+      const m = marketMap[cond];
+      if(m.closed && m.resolveTs) events.push({_type:"RESOLVE", ts:m.resolveTs, conditionId:cond, prices:m.prices, tokens:m.tokens});
+    }
+  }
+  events.sort((a,b) => (a.ts - b.ts) || ((a._type==="TRADE"?0:1) - (b._type==="TRADE"?0:1)));
+
+  const curve = [{ts: (events[0]?events[0].ts:0) - 1, equity: p.bankroll}];
   const markEquity = () => {
     let v = cash;
     for(const a in pos) v += pos[a].shares * pos[a].last;
     return v;
   };
 
-  for(const tr of trades){
+  for(const ev of events){
+    if(ev._type === "RESOLVE"){
+      for(const a in pos){
+        const ps = pos[a];
+        if(ps.conditionId !== ev.conditionId || ps.shares <= 1e-9) continue;
+        let idx = ev.tokens && ev.tokens.length ? ev.tokens.indexOf(ps.asset) : -1;
+        if(idx < 0) idx = ps.outcomeIndex;
+        const payout = clamp01(parseFloat(ev.prices ? ev.prices[idx] : NaN));
+        const credit = ps.shares * (isFinite(payout) ? payout : 0);   // $1 if this outcome won, ~$0 if it lost
+        cash += credit; ps.returned += credit; ps.settled = true; settledCount++;
+        log.push({ts:ev.ts, side:"RESOLVE", title:ps.title, outcome:ps.outcome,
+                  shares:ps.shares, price:(isFinite(payout)?payout:0), value:credit, pnl: ps.returned - ps.invested});
+        ps.shares = 0; ps.basis = 0;
+      }
+      curve.push({ts:ev.ts, equity:markEquity()});
+      continue;
+    }
+    const tr = ev;
     const a = tr.asset;
     if(!pos[a]) pos[a] = {asset:a, conditionId:tr.conditionId, outcomeIndex:tr.outcomeIndex,
       title:tr.title, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
@@ -398,11 +428,18 @@ function simulate(trades, p){
   }
 
   return { startBankroll:p.bankroll, cash, positions:Object.values(pos),
-           curve, log, copied, skipped, capped, fees, slip, noHold };
+           curve, log, copied, skipped, capped, fees, slip, noHold, settledCount };
 }
 
 // ---- Look up each market's resolution / live price (Gamma API) ----
 const parseArr = s => { try { return typeof s === "string" ? JSON.parse(s) : (s || []); } catch(e){ return []; } };
+const clamp01 = v => Math.min(1, Math.max(0, v));
+const toTs = v => {                          // ISO string or unix (s/ms) -> unix seconds
+  if(v == null || v === "") return 0;
+  if(typeof v === "number") return v > 2e10 ? Math.floor(v/1000) : v;
+  const n = Number(v); if(isFinite(n) && n > 1e9) return n > 2e10 ? Math.floor(n/1000) : n;
+  const t = Date.parse(v); return isFinite(t) ? Math.floor(t/1000) : 0;
+};
 
 async function fetchMarketPrices(conditionIds, proxy){
   const map = {};
@@ -422,7 +459,8 @@ async function fetchMarketPrices(conditionIds, proxy){
       const closed = !!(m.closed || m.umaResolutionStatus === "resolved");
       if(map[m.conditionId] && map[m.conditionId].closed && !closed) continue;  // keep settled record
       if(!map[m.conditionId]) priced++;
-      map[m.conditionId] = { closed, prices: parseArr(m.outcomePrices), tokens: parseArr(m.clobTokenIds) };
+      map[m.conditionId] = { closed, prices: parseArr(m.outcomePrices), tokens: parseArr(m.clobTokenIds),
+        resolveTs: closed ? toTs(m.closedTime || m.closedTimeIso || m.endDate || m.endDateIso) : 0 };
     }
   };
   for(let i = 0; i < ids.length; i += CHUNK){
@@ -452,8 +490,8 @@ function finalize(sim, p, marketMap){
     const finalValue = holding ? ps.shares * finalPrice : 0;
     if(holding){ openValue += finalValue; if(marked === "last-trade") fallback++; }
     const pnl = ps.returned + finalValue - ps.invested;
-    // status: closed (fully sold), resolved (held to settlement), or open (still live)
-    const status = !holding ? "closed" : (resolved ? "resolved" : "open");
+    // status: resolved (settled during the run or held to settlement), closed (fully sold), or open (still live)
+    const status = ps.settled ? "resolved" : (!holding ? "closed" : (resolved ? "resolved" : "open"));
     const decided = status !== "open";       // only decided positions count toward win/loss
     positions.push({ title:ps.title, outcome:ps.outcome, status, decided,
       shares:ps.shares, invested:ps.invested, out: ps.returned + finalValue,

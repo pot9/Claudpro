@@ -159,7 +159,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 10</span>
+    <br><span style="opacity:.6">version 11</span>
   </div>
 </div>
 
@@ -601,9 +601,12 @@ function drawChart(curve){
   const ctx = cv.getContext("2d"); ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
   if(curve.length < 2) return;
-  const xs = curve.map(c=>c.ts), ys = curve.map(c=>c.equity);
-  const x0=Math.min(...xs), x1=Math.max(...xs);
-  let y0=Math.min(...ys), y1=Math.max(...ys);
+  // loop-based min/max (spreading a large curve into Math.min/max overflows the stack)
+  let x0=Infinity, x1=-Infinity, y0=Infinity, y1=-Infinity;
+  for(const c of curve){
+    if(c.ts<x0)x0=c.ts; if(c.ts>x1)x1=c.ts;
+    if(c.equity<y0)y0=c.equity; if(c.equity>y1)y1=c.equity;
+  }
   if(y1===y0){ y1+=1; y0-=1; }
   const pad=8, gx=v=>pad+(v-x0)/(x1-x0||1)*(w-2*pad), gy=v=>h-pad-(v-y0)/(y1-y0)*(h-2*pad);
   // baseline (starting bankroll)

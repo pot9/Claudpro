@@ -160,7 +160,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 14</span>
+    <br><span style="opacity:.6">version 15</span>
   </div>
 </div>
 
@@ -380,6 +380,8 @@ function simulate(trades, p, marketMap){
         if(idx < 0) idx = ps.outcomeIndex;
         const payout = clamp01(parseFloat(ev.prices ? ev.prices[idx] : NaN));
         const credit = ps.shares * (isFinite(payout) ? payout : 0);   // $1 if this outcome won, ~$0 if it lost
+        const settlePnl = credit - ps.basis;                          // result of this settlement vs cost of held shares
+        if(settlePnl > 1e-9) ps.wTrades++; else if(settlePnl < -1e-9) ps.lTrades++;
         cash += credit; ps.returned += credit; ps.settled = true; settledCount++;
         log.push({ts:ev.ts, side:"RESOLVE", title:ps.title, outcome:ps.outcome,
                   shares:ps.shares, price:(isFinite(payout)?payout:0), value:credit, pnl: ps.returned - ps.invested});
@@ -392,7 +394,7 @@ function simulate(trades, p, marketMap){
     const a = tr.asset;
     if(!pos[a]) pos[a] = {asset:a, conditionId:tr.conditionId, outcomeIndex:tr.outcomeIndex,
       title:tr.title, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
-      invested:0, returned:0, bought:0, buys:0, sells:0};
+      invested:0, returned:0, bought:0, buys:0, sells:0, wTrades:0, lTrades:0};
     const ps = pos[a];
     ps.last = tr.price;
 
@@ -426,13 +428,15 @@ function simulate(trades, p, marketMap){
       const fill = clampPrice(tr.price * (1 - p.slip));
       const proceeds = sellShares * fill, fee = proceeds * p.fee;
       const costPortion = ps.basis * (sellShares / have);
+      const realized = (proceeds - fee) - costPortion;              // result of this sell vs cost of the shares sold
+      if(realized > 1e-9) ps.wTrades++; else if(realized < -1e-9) ps.lTrades++;
       cash += proceeds - fee;
       ps.shares -= sellShares; ps.basis -= costPortion; ps.returned += proceeds - fee; ps.sells++;
       fees += fee; slip += sellShares * (tr.price - fill);
       traderShares[a] = Math.max(0, before - tr.size);
       copied++;
       log.push({ts:tr.ts, side:"SELL", title:tr.title, outcome:tr.outcome,
-                shares:sellShares, price:fill, value:proceeds - fee, pnl:(proceeds-fee)-costPortion});
+                shares:sellShares, price:fill, value:proceeds - fee, pnl:realized});
     }
     curve.push({ts:tr.ts, equity:markEquity()});
   }
@@ -505,7 +509,7 @@ function finalize(sim, p, marketMap){
     const decided = status !== "open";       // only decided positions count toward win/loss
     positions.push({ title:ps.title, outcome:ps.outcome, status, decided,
       shares:ps.shares, invested:ps.invested, out: ps.returned + finalValue,
-      finalPrice, finalValue, pnl,
+      finalPrice, finalValue, pnl, wTrades:ps.wTrades, lTrades:ps.lTrades,
       avgEntry: ps.bought > 1e-9 ? ps.invested / ps.bought : finalPrice });
   }
 
@@ -603,10 +607,11 @@ function render(r){
     : s==="closed" ? `<span class="tag tSELL">sold</span>`
     : `<span class="tag tOPEN">open</span>`;
   $("openTbl").innerHTML =
-    "<tr><th>Market</th><th>Out</th><th>Status</th><th>In</th><th>Out$</th><th>P&L</th></tr>" +
+    "<tr><th>Market</th><th>Out</th><th>Status</th><th>Trades W/L</th><th>In</th><th>Out$</th><th>P&L</th></tr>" +
     r.positions.slice(0,300).map(o => `<tr>
       <td class="mkt">${esc(o.title)}</td><td>${esc(o.outcome)}</td>
       <td>${badge(o.status)}</td>
+      <td><span class="pos">${o.wTrades}</span> / <span class="neg">${o.lTrades}</span></td>
       <td>${fmtUSD(o.invested)}</td>
       <td>${fmtUSD(o.out)}</td>
       <td class="${cls(o.pnl)}">${fmtUSD(o.pnl)}</td></tr>`).join("");

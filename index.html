@@ -160,7 +160,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 13</span>
+    <br><span style="opacity:.6">version 14</span>
   </div>
 </div>
 
@@ -199,8 +199,10 @@ async function run(){
   $("run").disabled = true; $("results").classList.add("hidden");
   setStatus("Fetching trades…");
   try{
-    const cutoff = Math.floor(Date.now()/1000) - params.days*86400;
-    const { trades, truncated } = await fetchTrades(wallet, cutoff, params.proxy);
+    // Snap the window to a 5-minute boundary so re-runs use the EXACT same window (deterministic).
+    const endAnchor = Math.floor(Date.now()/1000/300)*300;
+    const cutoff = endAnchor - params.days*86400;
+    const { trades, truncated, partial } = await fetchTrades(wallet, cutoff, params.proxy, endAnchor);
     if(trades.length === 0){
       setStatus("No trades found for this wallet in the selected window.", true);
       $("run").disabled = false; return;
@@ -213,6 +215,8 @@ async function run(){
     const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
     const res = finalize(sim, params, marketMap);
     res.truncated = truncated;
+    res.partial = partial;
+    res.tradesLoaded = trades.length;
     res.ratio = params.ratio;
     res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
     res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
@@ -236,41 +240,43 @@ function setStatus(msg, isErr){
 // ---- Data ----
 // Primary: /activity supports start/end time filters, so we slice the window into
 // time chunks to get the FULL history past the 3000-offset cap. Falls back to /trades.
-async function fetchTrades(wallet, cutoff, proxy){
+async function fetchTrades(wallet, cutoff, proxy, endAnchor){
   try{
-    const r = await fetchViaActivity(wallet, cutoff, proxy);
+    const r = await fetchViaActivity(wallet, cutoff, proxy, endAnchor);
     if(r.trades.length) return r;
   }catch(e){
     if(/HTTP 400/.test(e.message)) throw e;   // real client error (e.g. bad wallet) — don't mask it
-    /* otherwise fall back to /trades below */
+    // /activity timed out/failed: fall back to /trades but FLAG it (smaller dataset → results differ)
+    const fb = await fetchViaTrades(wallet, cutoff, proxy);
+    fb.partial = true; return fb;
   }
-  return await fetchViaTrades(wallet, cutoff, proxy);
+  return await fetchViaTrades(wallet, cutoff, proxy);   // /activity returned empty
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function getJSON(url, proxy, tries = 3){
+async function getJSON(url, proxy, tries = 5){
   for(let i = 0; i < tries; i++){
     let res;
     try { res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}}); }
-    catch(e){ if(i === tries-1) throw e; await sleep(700*(i+1)); continue; }   // network blip → retry
+    catch(e){ if(i === tries-1) throw e; await sleep(800*(i+1)); continue; }   // network blip → retry
     if(res.ok){
       let data = await res.json();
       if(!Array.isArray(data)) data = data && data.data ? data.data : [];
       return data;
     }
-    // transient server errors (timeout / 5xx) → wait and retry
-    if((res.status === 408 || res.status === 429 || res.status >= 500) && i < tries-1){ await sleep(900*(i+1)); continue; }
+    // transient server errors (timeout / rate-limit / 5xx) → wait and retry
+    if((res.status === 408 || res.status === 429 || res.status >= 500) && i < tries-1){ await sleep(1000*(i+1)); continue; }
     let body = ""; try { body = (await res.text()).trim(); } catch(e){}
     const err = new Error(`API returned HTTP ${res.status}${body ? " — " + body.slice(0,200) : ""}`);
     err.__http = true; throw err;
   }
 }
 
-async function fetchViaActivity(wallet, cutoff, proxy){
+async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
   const limit = 500, MAX_OFFSET = 3000, CHUNK = 7*86400;   // request 7 days at a time so the server doesn't time out
   const all = [], seen = new Set();
-  let end = Math.floor(Date.now()/1000) + 1, truncated = false, guard = 0;
+  let end = (endAnchor || Math.floor(Date.now()/1000)) + 1, truncated = false, guard = 0;
   while(end > cutoff && guard++ < 2000){
     const winStart = Math.max(cutoff, end - CHUNK);
     let offset = 0, oldest = end, hitCap = false;
@@ -617,10 +623,13 @@ function render(r){
     </tr>`).join("");
 
   const parts = [];
+  parts.push(`<b>Data this run:</b> ${r.tradesLoaded} trades, priced ${r.marketsPriced}/${r.marketsRequested} markets. (For two runs to match, these two numbers must match.)`);
+  if(r.partial)
+    parts.push("⚠️ Full history couldn't load this run (the API was slow), so only the most recent ~3000 trades were used. Run again for the complete history — this is why results can differ between runs.");
   if(r.marketsRequested && r.marketsPriced === 0)
     parts.push("⚠️ Couldn't reach the market-resolution API (Gamma) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
-  else if(r.marketsRequested)
-    parts.push(`Priced ${r.marketsPriced} of ${r.marketsRequested} held markets from the market API.`);
+  else if(r.marketsRequested && r.marketsPriced < r.marketsRequested)
+    parts.push(`⚠️ Only ${r.marketsPriced} of ${r.marketsRequested} markets could be priced this run; the rest are valued at last traded price. If this count changes between runs, your profit and copied-trade count will change too — re-run until it's stable.`);
   if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
   if(r.openCount) parts.push(`${r.openCount} market(s) still open (not yet resolved) — their P&L is an estimate at the live price and is excluded from win rate.`);
   if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced individually, so they're valued at the last traded price.`);

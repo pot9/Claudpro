@@ -142,11 +142,15 @@
   </div>
 
   <div id="results" class="hidden">
+    <div class="card" id="compareCard">
+      <div class="secttitle">With costs vs without costs</div>
+      <div class="kpis" id="compare"></div>
+    </div>
     <div class="card">
-      <div class="secttitle">Result</div>
+      <div class="secttitle">Result (with your settings)</div>
       <div class="kpis" id="kpis"></div>
       <canvas id="chart" width="700" height="200"></canvas>
-      <div class="hint" style="text-align:center">Equity curve (USDC) over the look-back window</div>
+      <div class="hint" style="text-align:center">Solid line = with your settings · dashed line = zero costs</div>
       <div class="note" id="benchmark"></div>
     </div>
 
@@ -166,7 +170,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 16</span>
+    <br><span style="opacity:.6">version 17</span>
   </div>
 </div>
 
@@ -220,6 +224,13 @@ async function run(){
     setStatus("Running simulation…");
     const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
     const res = finalize(sim, params, marketMap);
+    // second run with zero costs, same everything else — for the comparison
+    if(params.slip > 0 || params.fee > 0){
+      const pIdeal = Object.assign({}, params, {slip:0, fee:0});
+      res.ideal = finalize(simulate(trades, pIdeal, marketMap), pIdeal, marketMap);
+    } else {
+      res.ideal = null;   // settings already have no costs — nothing to compare
+    }
     res.truncated = truncated;
     res.partial = partial;
     res.tradesLoaded = trades.length;
@@ -578,6 +589,21 @@ function benchmarkTraderPnl(trades, marketMap){
 function render(r){
   $("results").classList.remove("hidden");
   const cls = n => n>=0 ? "pos" : "neg";
+
+  // comparison: zero costs vs your settings
+  if(r.ideal){
+    const costOfCosts = r.ideal.netPnl - r.netPnl;
+    $("compareCard").classList.remove("hidden");
+    $("compare").innerHTML = `
+      ${kpi("No fees, no slippage", fmtUSD(r.ideal.netPnl) + " (" + fmtPct(r.ideal.roi) + ")", cls(r.ideal.netPnl))}
+      ${kpi("With your settings", fmtUSD(r.netPnl) + " (" + fmtPct(r.roi) + ")", cls(r.netPnl))}
+      ${kpi("Costs ate", fmtUSD(costOfCosts), "neg")}
+      ${kpi("Verdict", r.ideal.netPnl > 0 && r.netPnl <= 0 ? "Edge dies to costs" : (r.netPnl > 0 ? "Survives costs" : "Loses either way"),
+            cls(r.netPnl))}
+    `;
+  } else {
+    $("compareCard").classList.add("hidden");
+  }
   const pf = r.profitFactor === Infinity ? "∞" : r.profitFactor.toFixed(2);
   const wr = r.winRate == null ? "—" : (r.winRate*100).toFixed(0)+"%";
   $("kpis").innerHTML = `
@@ -596,7 +622,7 @@ function render(r){
     ${kpi("Trader P&L (full size)", fmtUSD(r.traderPnl), cls(r.traderPnl))}
     ${kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
   `;
-  drawChart(r.curve);
+  drawChart(r.curve, r.ideal ? r.ideal.curve : null);
 
   // benchmark check: with no costs and no skipped trades, your P&L should equal his × ratio
   const diff = r.netPnl - r.expectedPnl;
@@ -656,33 +682,39 @@ function kpi(k,v,c){ return `<div class="kpi"><div class="k">${k}</div><div clas
 function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function dt(ts){ const d=new Date(ts*1000); return (d.getMonth()+1)+"/"+d.getDate(); }
 
-function drawChart(curve){
+function drawChart(curve, idealCurve){
   const cv = $("chart"), dpr = window.devicePixelRatio||1;
   const w = cv.clientWidth, h = 200;
   cv.width = w*dpr; cv.height = h*dpr;
   const ctx = cv.getContext("2d"); ctx.scale(dpr,dpr);
   ctx.clearRect(0,0,w,h);
   if(curve.length < 2) return;
-  // loop-based min/max (spreading a large curve into Math.min/max overflows the stack)
+  // loop-based min/max over BOTH curves (spread into Math.min/max overflows the stack)
   let x0=Infinity, x1=-Infinity, y0=Infinity, y1=-Infinity;
-  for(const c of curve){
+  const scan = cs => { for(const c of cs){
     if(c.ts<x0)x0=c.ts; if(c.ts>x1)x1=c.ts;
-    if(c.equity<y0)y0=c.equity; if(c.equity>y1)y1=c.equity;
-  }
+    if(c.equity<y0)y0=c.equity; if(c.equity>y1)y1=c.equity; } };
+  scan(curve); if(idealCurve && idealCurve.length) scan(idealCurve);
   if(y1===y0){ y1+=1; y0-=1; }
   const pad=8, gx=v=>pad+(v-x0)/(x1-x0||1)*(w-2*pad), gy=v=>h-pad-(v-y0)/(y1-y0)*(h-2*pad);
+  const line = (cs) => { ctx.beginPath();
+    cs.forEach((c,i)=>{ const X=gx(c.ts),Y=gy(c.equity); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
+    ctx.stroke(); };
   // baseline (starting bankroll)
   const base = curve[0].equity;
   ctx.strokeStyle="#28324f"; ctx.lineWidth=1; ctx.setLineDash([4,4]);
   ctx.beginPath(); ctx.moveTo(pad,gy(base)); ctx.lineTo(w-pad,gy(base)); ctx.stroke();
+  // ideal (zero-cost) curve, dashed, behind
+  if(idealCurve && idealCurve.length > 1){
+    ctx.strokeStyle = "rgba(147,160,189,.8)"; ctx.lineWidth = 1.5; ctx.setLineDash([5,4]);
+    line(idealCurve);
+  }
   ctx.setLineDash([]);
-  // equity line
+  // actual equity line
   const up = curve[curve.length-1].equity >= base;
   ctx.strokeStyle = up ? "#34d399" : "#f87171"; ctx.lineWidth=2;
-  ctx.beginPath();
-  curve.forEach((c,i)=>{ const X=gx(c.ts),Y=gy(c.equity); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
-  ctx.stroke();
-  // fill
+  line(curve);
+  // fill under actual
   ctx.lineTo(gx(x1),gy(y0)); ctx.lineTo(gx(x0),gy(y0)); ctx.closePath();
   ctx.fillStyle = up ? "rgba(52,211,153,.10)" : "rgba(248,113,113,.10)"; ctx.fill();
 }

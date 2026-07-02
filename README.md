@@ -36,7 +36,7 @@ straight from the filesystem.
 | **Bankroll** | Starting capital in USDC. |
 | **Copy ratio** | Fraction of his size you copy. `0.1` = 10% of every trade he makes. |
 | **Slippage %** | Adverse price move you eat because you copy *after* he fills (1% default). |
-| **Fee %** (advanced) | Per-side trading fee. Polymarket spot fee is currently 0%; raise it to stress-test. |
+| **Fee category** (advanced) | Polymarket taker fees (added March 2026) use `fee = shares × rate × price × (1−price)`, charged on both buys and sells; settlement is free. Pick the category the trader trades: geopolitics free, sports 0.03 (max $0.75/100 sh), politics/finance/tech 0.04, economics/culture/weather 0.05, crypto 0.072 (max $1.80/100 sh). |
 | **Cash policy** (advanced) | Partially fill or skip a buy when you don't have enough cash. |
 | **CORS proxy** (advanced) | Only needed if your browser blocks the direct API call — see below. |
 

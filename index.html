@@ -112,9 +112,15 @@
     <div class="adv" id="advBox">
       <div class="row">
         <div>
-          <label for="fee">Fee % (per side)</label>
-          <input id="fee" type="number" inputmode="decimal" value="0" min="0" step="0.1" />
-          <div class="hint">Polymarket spot fee is 0%; set higher to stress-test.</div>
+          <label for="feecat">Fee category (what he trades)</label>
+          <select id="feecat">
+            <option value="0">Geopolitics / world events — free</option>
+            <option value="0.03">Sports (max $0.75 / 100 shares)</option>
+            <option value="0.04">Politics · Finance · Tech (max $1.00)</option>
+            <option value="0.05">Economics · Culture · Weather (max $1.25)</option>
+            <option value="0.072" selected>Crypto (max $1.80 / 100 shares)</option>
+          </select>
+          <div class="hint">Real Polymarket taker fee: shares × rate × price × (1−price), charged on buys and sells. Settlement is free.</div>
         </div>
         <div>
           <label for="cash">Cash policy</label>
@@ -160,7 +166,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 15</span>
+    <br><span style="opacity:.6">version 16</span>
   </div>
 </div>
 
@@ -190,7 +196,7 @@ async function run(){
     bankroll: Math.max(0, parseFloat($("bankroll").value)||0),
     ratio: Math.max(0, parseFloat($("ratio").value)||0),
     slip: Math.max(0, parseFloat($("slip").value)||0)/100,
-    fee: Math.max(0, parseFloat($("fee").value)||0)/100,
+    fee: Math.max(0, parseFloat($("feecat").value)||0),   // base rate: fee = shares × rate × p × (1−p)
     cashPolicy: $("cash").value,
     proxy: $("proxy").value.trim()
   };
@@ -400,15 +406,16 @@ function simulate(trades, p, marketMap){
 
     if(tr.side === "BUY"){
       const fill = clampPrice(tr.price * (1 + p.slip));
+      const feePer = p.fee * fill * (1 - fill);              // Polymarket taker fee per share: rate × p × (1−p)
       let shares = tr.size * p.ratio;
-      let cost = shares * fill, fee = cost * p.fee;
+      let cost = shares * fill, fee = shares * feePer;
       if(cost + fee > cash){
         if(p.cashPolicy === "skip" || cash <= 0){
           skipped++; traderShares[a] = (traderShares[a]||0) + tr.size;
           curve.push({ts:tr.ts, equity:markEquity()}); continue;
         }
-        shares = cash / (fill * (1 + p.fee));   // partial fill with the cash we have
-        cost = shares * fill; fee = cost * p.fee; capped++;
+        shares = cash / (fill + feePer);        // partial fill with the cash we have
+        cost = shares * fill; fee = shares * feePer; capped++;
       }
       cash -= cost + fee;
       ps.shares += shares; ps.basis += cost + fee; ps.invested += cost + fee; ps.bought += shares; ps.buys++;
@@ -426,7 +433,7 @@ function simulate(trades, p, marketMap){
       }
       const sellShares = before > 1e-9 ? have * Math.min(1, tr.size/before) : Math.min(have, tr.size * p.ratio);
       const fill = clampPrice(tr.price * (1 - p.slip));
-      const proceeds = sellShares * fill, fee = proceeds * p.fee;
+      const proceeds = sellShares * fill, fee = sellShares * p.fee * fill * (1 - fill);   // taker fee on sells too
       const costPortion = ps.basis * (sellShares / have);
       const realized = (proceeds - fee) - costPortion;              // result of this sell vs cost of the shares sold
       if(realized > 1e-9) ps.wTrades++; else if(realized < -1e-9) ps.lTrades++;

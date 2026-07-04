@@ -30,6 +30,10 @@
   button{width:100%;margin-top:16px;padding:14px;border:none;border-radius:12px;
     background:var(--accent);color:#fff;font-size:16px;font-weight:600;cursor:pointer}
   button:disabled{opacity:.55;cursor:default}
+  button.secondary{background:var(--card2);border:1px solid var(--line);color:var(--txt);
+    font-weight:500;margin-top:10px;font-size:14px}
+  .loadBtn{width:auto;margin:0;padding:5px 10px;font-size:12px;border-radius:8px;
+    background:var(--accent);color:#fff;border:none}
   .adv-toggle{background:none;color:var(--accent);font-weight:500;font-size:13px;
     width:auto;margin:8px 0 0;padding:4px 0}
   .adv{display:none}
@@ -138,7 +142,14 @@
     </div>
 
     <button id="run" type="button">Run backtest</button>
+    <button id="scanBtn" class="secondary" type="button">Scan top 10 leaderboard traders</button>
     <div class="status" id="status"></div>
+  </div>
+
+  <div class="card hidden" id="scanCard">
+    <div class="secttitle">Leaderboard scan — top traders by profit, backtested with your settings</div>
+    <div class="scroll"><table id="scanTbl"></table></div>
+    <div class="note" id="scanNote"></div>
   </div>
 
   <div id="results" class="hidden">
@@ -180,7 +191,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 20</span>
+    <br><span style="opacity:.6">version 21</span>
   </div>
 </div>
 
@@ -199,13 +210,10 @@ $("advBtn").onclick = () => {
 };
 
 $("run").onclick = run;
+$("scanBtn").onclick = scanLeaderboard;
 
-async function run(){
-  const wallet = $("wallet").value.trim().toLowerCase();
-  if(!/^0x[0-9a-f]{40}$/.test(wallet)){
-    setStatus("Enter a valid 0x… wallet address.", true); return;
-  }
-  const params = {
+function readParams(){
+  return {
     days: parseInt($("lookback").value,10),
     bankroll: Math.max(0, parseFloat($("bankroll").value)||0),
     ratio: Math.max(0, parseFloat($("ratio").value)||0),
@@ -214,6 +222,33 @@ async function run(){
     cashPolicy: $("cash").value,
     proxy: $("proxy").value.trim()
   };
+}
+
+// Shared per-trader pipeline: trades already fetched -> full result object
+function analyze(trades, marketMap, params){
+  const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
+  const res = finalize(sim, params, marketMap);
+  // second run with zero costs, same everything else — for the comparison
+  if(params.slip > 0 || params.fee > 0){
+    const pIdeal = Object.assign({}, params, {slip:0, fee:0});
+    res.ideal = finalize(simulate(trades, pIdeal, marketMap), pIdeal, marketMap);
+  } else {
+    res.ideal = null;   // settings already have no costs — nothing to compare
+  }
+  res.tradesLoaded = trades.length;
+  res.ratio = params.ratio;
+  res.copyability = copyability(trades, marketMap, params.ratio);
+  res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
+  res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
+  return res;
+}
+
+async function run(){
+  const wallet = $("wallet").value.trim().toLowerCase();
+  if(!/^0x[0-9a-f]{40}$/.test(wallet)){
+    setStatus("Enter a valid 0x… wallet address.", true); return;
+  }
+  const params = readParams();
   if(params.bankroll<=0){ setStatus("Bankroll must be greater than 0.", true); return; }
 
   $("run").disabled = true; $("results").classList.add("hidden");
@@ -232,22 +267,9 @@ async function run(){
     const condIds = [...new Set(trades.map(t => t.conditionId))];
     const marketMap = await fetchMarketPrices(condIds, params.proxy);
     setStatus("Running simulation…");
-    const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
-    const res = finalize(sim, params, marketMap);
-    // second run with zero costs, same everything else — for the comparison
-    if(params.slip > 0 || params.fee > 0){
-      const pIdeal = Object.assign({}, params, {slip:0, fee:0});
-      res.ideal = finalize(simulate(trades, pIdeal, marketMap), pIdeal, marketMap);
-    } else {
-      res.ideal = null;   // settings already have no costs — nothing to compare
-    }
+    const res = analyze(trades, marketMap, params);
     res.truncated = truncated;
     res.partial = partial;
-    res.tradesLoaded = trades.length;
-    res.ratio = params.ratio;
-    res.copyability = copyability(trades, marketMap, params.ratio);
-    res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
-    res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
     render(res, params);
     const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
     setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.${note}`);
@@ -351,6 +373,94 @@ async function fetchViaTrades(wallet, cutoff, proxy){
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
   return { trades, truncated: truncated && !reachedCutoff };
+}
+
+// ---- Leaderboard scan ----
+const SCAN_ORDER = "PNL";   // ranking criterion (change to "VOL" for volume leaders)
+const SCAN_COUNT = 10;
+
+const periodForDays = d => d <= 1 ? "DAY" : d <= 7 ? "WEEK" : d <= 30 ? "MONTH" : "ALL";
+
+async function fetchLeaderboard(days, proxy){
+  const url = `${API_BASE}/v1/leaderboard?category=OVERALL&timePeriod=${periodForDays(days)}`
+            + `&orderBy=${SCAN_ORDER}&limit=${SCAN_COUNT}`;
+  const arr = await getJSON(url, proxy);
+  return arr.map(t => ({
+    wallet: String(t.proxyWallet || t.wallet || "").toLowerCase(),
+    name: t.userName || t.name || t.pseudonym || "(no name)",
+    pnl: num(t.pnl || 0)
+  })).filter(t => /^0x[0-9a-f]{40}$/.test(t.wallet));
+}
+
+async function scanLeaderboard(){
+  const params = readParams();
+  if(params.bankroll<=0){ setStatus("Bankroll must be greater than 0.", true); return; }
+  $("run").disabled = true; $("scanBtn").disabled = true;
+  $("results").classList.add("hidden"); $("scanCard").classList.add("hidden");
+  try{
+    setStatus("Fetching leaderboard…");
+    const traders = await fetchLeaderboard(params.days, params.proxy);
+    if(traders.length === 0){ setStatus("Leaderboard returned no traders.", true); return; }
+    const endAnchor = Math.floor(Date.now()/1000/300)*300;
+    const cutoff = endAnchor - params.days*86400;
+    const rows = [];
+    for(let i = 0; i < traders.length; i++){
+      const t = traders[i];
+      setStatus(`Scanning ${i+1}/${traders.length}: ${t.name}…`);
+      try{
+        const { trades, truncated } = await fetchViaTrades(t.wallet, cutoff, params.proxy);  // quick: 3000-trade cap
+        if(trades.length === 0){ rows.push({name:t.name, wallet:t.wallet, empty:true}); continue; }
+        const condIds = [...new Set(trades.map(x => x.conditionId))];
+        const marketMap = await fetchMarketPrices(condIds, params.proxy);
+        const res = analyze(trades, marketMap, params);
+        rows.push({ name:t.name, wallet:t.wallet, capped:truncated,
+          netPnl:res.netPnl, roi:res.roi, winRate:res.winRate,
+          profitFactor:res.profitFactor, topShare:res.topShare,
+          verdict:res.copyability.verdict, verdictLevel:res.copyability.verdictLevel });
+      }catch(e){
+        console.error(t.name, e);
+        rows.push({name:t.name, wallet:t.wallet, failed:true});
+      }
+    }
+    renderScan(rows, params);
+    setStatus(`Scan done — ${rows.filter(r=>!r.failed&&!r.empty).length} of ${traders.length} traders analyzed. Tap "Load" on a row for the full detailed backtest.`);
+  }catch(e){
+    console.error(e);
+    setStatus("Scan error: " + e.message + (params.proxy ? "" :
+      " — if this is a CORS/network block, add a CORS proxy in Advanced settings."), true);
+  }finally{
+    $("run").disabled = false; $("scanBtn").disabled = false;
+  }
+}
+
+function renderScan(rows, params){
+  const ok = rows.filter(r => !r.failed && !r.empty).sort((a,b) => b.netPnl - a.netPnl);
+  const bad = rows.filter(r => r.failed || r.empty);
+  const cls = n => n>=0 ? "pos" : "neg";
+  const vCls = l => l === 0 ? "pos" : l === 1 ? "" : "neg";
+  $("scanCard").classList.remove("hidden");
+  $("scanTbl").innerHTML =
+    "<tr><th></th><th>Trader</th><th>Your P&L</th><th>ROI</th><th>Win</th><th>PF</th><th>Top ev.</th><th>Copyable?</th></tr>" +
+    ok.map((r,i) => `<tr>
+      <td><button class="loadBtn" data-w="${r.wallet}" type="button">Load</button></td>
+      <td class="mkt">${esc(r.name)}${r.capped ? " ⚠" : ""}</td>
+      <td class="${cls(r.netPnl)}">${fmtUSD(r.netPnl)}</td>
+      <td class="${cls(r.roi)}">${fmtPct(r.roi)}</td>
+      <td>${r.winRate == null ? "—" : Math.round(r.winRate*100)+"%"}</td>
+      <td>${r.profitFactor === Infinity ? "∞" : r.profitFactor.toFixed(2)}</td>
+      <td>${r.topShare == null ? "—" : Math.round(r.topShare*100)+"%"}</td>
+      <td class="${vCls(r.verdictLevel)}">${esc(r.verdict)}</td>
+    </tr>`).join("") +
+    bad.map(r => `<tr><td></td><td class="mkt">${esc(r.name)}</td>
+      <td colspan="6" class="neg">${r.empty ? "no trades in window" : "failed to load"}</td></tr>`).join("");
+  $("scanNote").textContent =
+    "Quick scan: each trader capped at their most recent 3000 trades (⚠ = capped, period shorter than selected). " +
+    "Sorted by your P&L with your current settings (bankroll, ratio, costs). Tap Load for the exact full backtest.";
+  document.querySelectorAll("#scanTbl .loadBtn").forEach(b => b.onclick = () => {
+    $("wallet").value = b.dataset.w;
+    $("scanCard").classList.add("hidden");
+    run();
+  });
 }
 
 const num = v => typeof v === "number" ? v : parseFloat(v);

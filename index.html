@@ -170,7 +170,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 17</span>
+    <br><span style="opacity:.6">version 18</span>
   </div>
 </div>
 
@@ -357,6 +357,7 @@ function normalize(t){
     price: num(t.price),
     size: num(t.size || t.shares || t.amount || 0),
     title: t.title || t.market || t.eventSlug || t.slug || "market",
+    eventSlug: String(t.eventSlug || t.slug || ""),
     outcome: t.outcome || (t.outcomeIndex != null ? "#" + t.outcomeIndex : ""),
     trader: t.name || t.pseudonym || ""
   };
@@ -410,7 +411,7 @@ function simulate(trades, p, marketMap){
     const tr = ev;
     const a = tr.asset;
     if(!pos[a]) pos[a] = {asset:a, conditionId:tr.conditionId, outcomeIndex:tr.outcomeIndex,
-      title:tr.title, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
+      title:tr.title, eventSlug:tr.eventSlug, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
       invested:0, returned:0, bought:0, buys:0, sells:0, wTrades:0, lTrades:0};
     const ps = pos[a];
     ps.last = tr.price;
@@ -525,7 +526,7 @@ function finalize(sim, p, marketMap){
     // status: resolved (settled during the run or held to settlement), closed (fully sold), or open (still live)
     const status = ps.settled ? "resolved" : (!holding ? "closed" : (resolved ? "resolved" : "open"));
     const decided = status !== "open";       // only decided positions count toward win/loss
-    positions.push({ title:ps.title, outcome:ps.outcome, status, decided,
+    positions.push({ title:ps.title, eventSlug:ps.eventSlug, outcome:ps.outcome, status, decided,
       shares:ps.shares, invested:ps.invested, out: ps.returned + finalValue,
       finalPrice, finalValue, pnl, wTrades:ps.wTrades, lTrades:ps.lTrades,
       avgEntry: ps.bought > 1e-9 ? ps.invested / ps.bought : finalPrice });
@@ -543,6 +544,20 @@ function finalize(sim, p, marketMap){
   const profitFactor = grossLoss > 1e-9 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0);
   const expectancy = decided.length ? (grossProfit - grossLoss) / decided.length : 0;
 
+  // Diversification: group decided P&L by event (all markets of the same story = one event)
+  const evGroups = {};
+  for(const x of decided){
+    const k = x.eventSlug || x.title;
+    if(!evGroups[k]) evGroups[k] = { pnl: 0, title: x.title };
+    evGroups[k].pnl += x.pnl;
+  }
+  const evArr = Object.values(evGroups).sort((a,b)=> b.pnl - a.pnl);
+  const netDecided = grossProfit - grossLoss;
+  const topEvent = evArr[0] || null;
+  const top3Pnl = evArr.slice(0,3).reduce((s,x)=>s+x.pnl, 0);
+  const topShare  = (topEvent && netDecided > 1e-9) ? topEvent.pnl / netDecided : null;
+  const top3Share = (evArr.length && netDecided > 1e-9) ? top3Pnl / netDecided : null;
+
   // max drawdown over the equity curve, with a final settled point appended
   const curve = sim.curve.concat([{ ts: sim.curve[sim.curve.length-1].ts + 1, equity: endingEquity }]);
   let peak = -Infinity, maxDD = 0;
@@ -556,6 +571,7 @@ function finalize(sim, p, marketMap){
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
     maxDD, fallback, marketsPriced: marketMap.__priced || 0, marketsRequested: marketMap.__requested || 0,
+    topEvent, topShare, top3Share, eventCount: evArr.length,
     positions: positions.sort((a,b)=> b.pnl - a.pnl),
     log: sim.log.slice().reverse(), curve
   };
@@ -621,6 +637,10 @@ function render(r){
     ${kpi("Ending bankroll", fmtUSD(r.endingEquity), cls(r.netPnl))}
     ${kpi("Trader P&L (full size)", fmtUSD(r.traderPnl), cls(r.traderPnl))}
     ${kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
+    ${kpi("Top event share of profit", r.topShare == null ? "—" : Math.round(r.topShare*100)+"%",
+          r.topShare != null && r.topShare > 0.5 ? "neg" : "pos")}
+    ${kpi("Top 3 events share", r.top3Share == null ? "—" : Math.round(r.top3Share*100)+"%",
+          r.top3Share != null && r.top3Share > 0.8 ? "neg" : "pos")}
   `;
   drawChart(r.curve, r.ideal ? r.ideal.curve : null);
 
@@ -674,6 +694,13 @@ function render(r){
   if(r.skipped) parts.push(`${r.skipped} buy(s) skipped — you ran out of cash (raise bankroll or lower copy ratio to copy more).`);
   if(r.capped) parts.push(`${r.capped} buy(s) only partially filled (cash-capped).`);
   if(r.noHold) parts.push(`${r.noHold} sell(s) skipped — he sold positions you weren't holding (entered before the window, or you'd skipped the buy).`);
+  if(r.topEvent && r.topShare != null){
+    const pc = Math.round(r.topShare*100);
+    parts.push(`<b>Diversification:</b> his single best event ("${esc(r.topEvent.title)}") made ${fmtUSD(r.topEvent.pnl)} = <b>${pc}%</b> of the profit, across ${r.eventCount} events. ` +
+      (r.topShare > 0.5
+        ? "⚠️ Over half the profit is one story — bets on the same event win or lose together, so this result leans on one good call rather than repeatable skill. Test a longer window."
+        : "Profit is reasonably spread across different events — a good sign."));
+  }
   parts.push("Win rate, avg win/loss, profit factor and expectancy are computed over decided markets only (sold or resolved).");
   $("caveats").innerHTML = parts.join(" ");
 }

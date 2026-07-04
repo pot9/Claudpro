@@ -154,6 +154,11 @@
       <div class="note" id="benchmark"></div>
     </div>
 
+    <div class="card" id="topEventsCard">
+      <div class="secttitle">Top events breakdown — how the big profits actually happened</div>
+      <div id="topEvents"></div>
+    </div>
+
     <div class="card" id="openCard">
       <div class="secttitle">Per-market results — every position you copied (In = put in, Out$ = got back)</div>
       <div class="scroll"><table id="openTbl"></table></div>
@@ -170,7 +175,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 18</span>
+    <br><span style="opacity:.6">version 19</span>
   </div>
 </div>
 
@@ -412,9 +417,11 @@ function simulate(trades, p, marketMap){
     const a = tr.asset;
     if(!pos[a]) pos[a] = {asset:a, conditionId:tr.conditionId, outcomeIndex:tr.outcomeIndex,
       title:tr.title, eventSlug:tr.eventSlug, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
-      invested:0, returned:0, bought:0, buys:0, sells:0, wTrades:0, lTrades:0};
+      invested:0, returned:0, bought:0, buys:0, sells:0, wTrades:0, lTrades:0, firstTs:tr.ts, lastTs:tr.ts};
     const ps = pos[a];
     ps.last = tr.price;
+    if(tr.ts < ps.firstTs) ps.firstTs = tr.ts;
+    if(tr.ts > ps.lastTs) ps.lastTs = tr.ts;
 
     if(tr.side === "BUY"){
       const fill = clampPrice(tr.price * (1 + p.slip));
@@ -529,6 +536,7 @@ function finalize(sim, p, marketMap){
     positions.push({ title:ps.title, eventSlug:ps.eventSlug, outcome:ps.outcome, status, decided,
       shares:ps.shares, invested:ps.invested, out: ps.returned + finalValue,
       finalPrice, finalValue, pnl, wTrades:ps.wTrades, lTrades:ps.lTrades,
+      buys:ps.buys, sells:ps.sells, bought:ps.bought, firstTs:ps.firstTs, lastTs:ps.lastTs,
       avgEntry: ps.bought > 1e-9 ? ps.invested / ps.bought : finalPrice });
   }
 
@@ -548,8 +556,14 @@ function finalize(sim, p, marketMap){
   const evGroups = {};
   for(const x of decided){
     const k = x.eventSlug || x.title;
-    if(!evGroups[k]) evGroups[k] = { pnl: 0, title: x.title };
-    evGroups[k].pnl += x.pnl;
+    if(!evGroups[k]) evGroups[k] = { pnl:0, title:x.title, markets:0, buys:0, sells:0,
+      settled:0, sold:0, invested:0, bought:0, firstTs:x.firstTs, lastTs:x.lastTs };
+    const g = evGroups[k];
+    g.pnl += x.pnl; g.markets++; g.buys += x.buys; g.sells += x.sells;
+    g.invested += x.invested; g.bought += x.bought;
+    if(x.status === "resolved") g.settled++; else if(x.status === "closed") g.sold++;
+    if(x.firstTs < g.firstTs) g.firstTs = x.firstTs;
+    if(x.lastTs > g.lastTs) g.lastTs = x.lastTs;
   }
   const evArr = Object.values(evGroups).sort((a,b)=> b.pnl - a.pnl);
   const netDecided = grossProfit - grossLoss;
@@ -571,7 +585,8 @@ function finalize(sim, p, marketMap){
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
     maxDD, fallback, marketsPriced: marketMap.__priced || 0, marketsRequested: marketMap.__requested || 0,
-    topEvent, topShare, top3Share, eventCount: evArr.length,
+    topEvent, topShare, top3Share, eventCount: evArr.length, topEvents: evArr.slice(0,3),
+    netDecided,
     positions: positions.sort((a,b)=> b.pnl - a.pnl),
     log: sim.log.slice().reverse(), curve
   };
@@ -643,6 +658,30 @@ function render(r){
           r.top3Share != null && r.top3Share > 0.8 ? "neg" : "pos")}
   `;
   drawChart(r.curve, r.ideal ? r.ideal.curve : null);
+
+  // top events breakdown — one buy? many trades? over how many days? how did it end?
+  if(r.topEvents && r.topEvents.length && r.netDecided > 1e-9){
+    $("topEventsCard").classList.remove("hidden");
+    const dtFull = ts => { const d = new Date(ts*1000); return (d.getMonth()+1)+"/"+d.getDate(); };
+    $("topEvents").innerHTML = r.topEvents.map((g,i) => {
+      const days = Math.max(1, Math.round((g.lastTs - g.firstTs)/86400));
+      const pc = Math.round(g.pnl / r.netDecided * 100);
+      const avgEntry = g.bought > 1e-9 ? (g.invested/g.bought) : 0;
+      const oneShot = (g.buys <= 2 && days <= 1);
+      return `<div class="note" style="margin-top:${i?10:0}px">
+        <b>${i+1}. ${esc(g.title)}</b> — <b class="${g.pnl>=0?'pos':'neg'}">${fmtUSD(g.pnl)}</b> (${pc}% of profit)<br>
+        ${g.markets} market(s) · <b>${g.buys} buy(s), ${g.sells} sell(s)</b> ·
+        ended: ${g.settled} settled, ${g.sold} sold ·
+        active <b>${dtFull(g.firstTs)} → ${dtFull(g.lastTs)}</b> (${days} day(s)) ·
+        avg entry ${(avgEntry*100).toFixed(0)}¢/share
+        <br><i>${oneShot
+          ? "⚠️ One-shot bet: bought once and waited — a single call, not a built position."
+          : "Position built across multiple trades/days — deliberate, not a single lucky click."}</i>
+      </div>`;
+    }).join("");
+  } else {
+    $("topEventsCard").classList.add("hidden");
+  }
 
   // benchmark check: with no costs and no skipped trades, your P&L should equal his × ratio
   const diff = r.netPnl - r.expectedPnl;

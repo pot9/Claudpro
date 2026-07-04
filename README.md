@@ -74,6 +74,13 @@ curve, your still-open positions, and the full copied-trade log.
 - The wallet must be the trader's **proxy wallet** (the one in their profile URL),
   which is what the data API keys on.
 
+## 24/7 trade alerts (Discord)
+
+Want a Discord message every time a trader buys or sells — phone off, day and night?
+The [`watcher/`](./watcher/) folder contains a free Cloudflare Worker that polls the
+trader's wallet every 2 minutes and posts each new trade to a Discord webhook.
+Follow the 5-minute guide in [`watcher/SETUP.md`](./watcher/SETUP.md).
+
 ## If the API call is blocked (CORS)
 
 The app talks to Polymarket directly from your browser. If your browser blocks

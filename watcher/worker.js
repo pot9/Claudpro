@@ -1,13 +1,19 @@
 // Polymarket trader watcher — Cloudflare Worker
 //
 // Watches one trader's wallet and posts every new BUY/SELL to a Discord webhook.
-// Runs on a Cron Trigger (suggested: */2 * * * *). See SETUP.md for the 5-minute setup.
+// Runs on a Cron Trigger (suggested: */2 * * * *). See SETUP.md for the setup.
+
+// ================= FILL THESE TWO IN (paste between the quotes), then Deploy =================
+const CFG_WALLET  = "";   // the trader's wallet, e.g. "0x095fbca2e0eaf0c9841005135427e1e0117190b2"
+const CFG_WEBHOOK = "";   // your Discord webhook URL, e.g. "https://discord.com/api/webhooks/..."
+const CFG_MIN_USD = "";   // optional: skip trades under this many dollars, e.g. "50" (leave "" for all)
+// ============================================================================================
 //
-// Required settings on the Worker:
-//   WALLET           (variable)  the trader's 0x… proxy wallet
-//   DISCORD_WEBHOOK  (secret)    your Discord webhook URL
-//   MIN_USD          (variable, optional) skip trades smaller than this, e.g. "50"
-//   STATE            (KV binding) any KV namespace
+// (Advanced: instead of the two lines above you can set WALLET / DISCORD_WEBHOOK / MIN_USD as
+//  Worker Variables — env values win over the constants. Either way works.)
+//
+// KV binding STATE (any KV namespace) remembers which trades were already sent. If it isn't
+// bound the worker still runs using temporary memory (it may repeat an alert after a restart).
 
 const API = "https://data-api.polymarket.com";
 const OVERLAP_S = 300;   // re-check the last 5 min (API indexing lag)
@@ -56,20 +62,35 @@ async function postDiscord(webhook, content) {
   if (!res.ok && res.status !== 204) throw new Error(`Discord HTTP ${res.status}`);
 }
 
+// Resolve config: a Worker Variable (env) wins, else the CFG_* constant above.
+const cfgWallet  = env => String(env.WALLET || CFG_WALLET || "").toLowerCase();
+const cfgWebhook = env => env.DISCORD_WEBHOOK || CFG_WEBHOOK || "";
+const cfgMinUsd  = env => num(env.MIN_USD || CFG_MIN_USD);
+
+// KV is optional: if STATE isn't bound, fall back to temporary in-memory storage so the
+// worker never crashes (may repeat an alert after a cold start — harmless).
+let MEM = null;
+const store = env => env.STATE || {
+  get: async () => MEM,
+  put: async (_k, v) => { MEM = v; }
+};
+
 // One polling pass. Exported for offline tests.
 async function check(env, nowS) {
-  const wallet = String(env.WALLET || "").toLowerCase();
-  if (!/^0x[0-9a-f]{40}$/.test(wallet)) throw new Error("WALLET variable is not a valid 0x… address");
-  const minUsd = num(env.MIN_USD);
+  const wallet = cfgWallet(env);
+  if (!/^0x[0-9a-f]{40}$/.test(wallet)) throw new Error("Wallet is not set (fill CFG_WALLET or the WALLET variable)");
+  const webhook = cfgWebhook(env);
+  const minUsd = cfgMinUsd(env);
+  const kv = store(env);
 
-  const raw = await env.STATE.get("state");
+  const raw = await kv.get("state");
   let state = null;
   try { state = raw ? JSON.parse(raw) : null; } catch (e) { state = null; }
 
   // First run: remember "now" and do NOT spam his old trades.
   if (!state || !state.ts) {
     state = { ts: nowS, seen: [], checked: nowS, alerts: 0 };
-    await env.STATE.put("state", JSON.stringify(state));
+    await kv.put("state", JSON.stringify(state));
     return { sent: 0, first: true };
   }
 
@@ -83,11 +104,11 @@ async function check(env, nowS) {
 
   let sent = 0;
   for (const t of fresh.slice(0, MAX_MSGS)) {
-    await postDiscord(env.DISCORD_WEBHOOK, formatTrade(t));
+    await postDiscord(webhook, formatTrade(t));
     sent++;
   }
   if (fresh.length > MAX_MSGS) {
-    await postDiscord(env.DISCORD_WEBHOOK, `…and ${fresh.length - MAX_MSGS} more trades in the same window.`);
+    await postDiscord(webhook, `…and ${fresh.length - MAX_MSGS} more trades in the same window.`);
   }
 
   // Save only when something changed (KV free tier allows 1,000 writes/day).
@@ -97,7 +118,7 @@ async function check(env, nowS) {
     for (const t of fresh) if (num(t.timestamp) > maxTs) maxTs = num(t.timestamp);
     state = { ts: maxTs, seen: [...seen].slice(-SEEN_KEEP),
               checked: nowS, alerts: (state.alerts || 0) + sent };
-    await env.STATE.put("state", JSON.stringify(state));
+    await kv.put("state", JSON.stringify(state));
   }
   return { sent, fresh: fresh.length };
 }
@@ -109,20 +130,25 @@ export default {
 
   async fetch(request, env) {
     const url = new URL(request.url);
+    const wallet = cfgWallet(env);
+    const webhook = cfgWebhook(env);
     if (url.searchParams.get("test") === "1") {
+      if (!webhook) return new Response("Discord test FAILED: webhook not set — fill CFG_WEBHOOK in the code (or the DISCORD_WEBHOOK variable), then Deploy.", { status: 500 });
       try {
-        await postDiscord(env.DISCORD_WEBHOOK,
-          `✅ Watcher is working. Watching **${env.WALLET}** — you will get a message here on every buy/sell.`);
+        await postDiscord(webhook,
+          `✅ Watcher is working. Watching **${wallet || "(no wallet set!)"}** — you will get a message here on every buy/sell.`);
         return new Response("Test message sent — check your Discord channel.");
       } catch (e) {
         return new Response("Discord test FAILED: " + e.message, { status: 500 });
       }
     }
     let state = null;
-    try { state = JSON.parse((await env.STATE.get("state")) || "null"); } catch (e) {}
+    try { state = JSON.parse((await store(env).get("state")) || "null"); } catch (e) {}
     const lines = [
       "Polymarket trader watcher — alive ✅",
-      `Watching: ${env.WALLET || "(WALLET not set!)"}`,
+      `Watching: ${wallet || "(wallet not set — fill CFG_WALLET in the code, then Deploy)"}`,
+      `Discord webhook: ${webhook ? "set ✅" : "NOT set — fill CFG_WEBHOOK, then Deploy"}`,
+      `Memory (KV): ${env.STATE ? "connected ✅" : "using temporary memory (bind STATE for best results)"}`,
       state ? `Watermark: ${new Date(state.ts * 1000).toISOString()}` : "First check has not run yet (waiting for the cron trigger).",
       state ? `Alerts sent so far: ${state.alerts || 0}` : "",
       "",

@@ -26,19 +26,22 @@ Latency: a new trade shows up in Discord within about **2–3 minutes**.
 2. In the left menu: **Storage & Databases → KV** → **Create namespace** → name it `watcher-state` → Create.
    *(This is the robot's tiny memory — it remembers which trades it already told you about.)*
 3. Left menu: **Compute (Workers & Pages)** → **Create** → **Create Worker** → give it a name (e.g. `poly-watcher`) → **Deploy**.
-4. Tap **Edit code** → delete everything → **paste the whole contents of [`worker.js`](./worker.js)** → **Deploy**.
-5. Go back to the worker's page → **Settings** → **Variables and Secrets**:
-   - Add variable `WALLET` = the trader's `0x…` address (from their Polymarket profile URL).
-   - Add **secret** `DISCORD_WEBHOOK` = the URL you copied in Part 1 (choose type "Secret"/Encrypt).
-   - *(Optional)* variable `MIN_USD` = e.g. `50` to ignore his tiny trades.
-6. Still in **Settings** → **Bindings** → **Add** → **KV namespace**:
-   - Variable name: `STATE` (exactly like that, capital letters)
+4. Tap **Edit code** → delete everything → **paste the whole contents of [`worker.js`](./worker.js)**.
+5. **Fill in your two values** at the very top of the code (between the quotes):
+   ```js
+   const CFG_WALLET  = "0x...your trader wallet...";
+   const CFG_WEBHOOK = "https://discord.com/api/webhooks/...your URL...";
+   ```
+   *(This is simpler and more reliable than Cloudflare's Variables screen. Your webhook stays
+   private inside your own Cloudflare account.)*
+   Then tap **Deploy**.
+6. Go to the **Bindings** tab → **Add binding** → **KV namespace**:
+   - Variable name: `STATE` (exactly, capitals)
    - KV namespace: `watcher-state` → Save.
-7. **Settings** → **Triggers** (or "Trigger Events") → **Cron Triggers** → **Add** → schedule:
-   ```
-   */2 * * * *
-   ```
-   (= check every 2 minutes) → Save.
+   *(Optional but recommended — without it the watcher still works but may repeat an alert
+   after a restart.)*
+7. **Settings** → **Triggers** → **Cron Triggers** → **Add** → every **1 minute** (`* * * * *`)
+   or every 2 minutes (`*/2 * * * *`) → Save.
 
 ## Part 3 — Test it (30 seconds)
 

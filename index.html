@@ -146,6 +146,11 @@
       <div class="secttitle">With costs vs without costs</div>
       <div class="kpis" id="compare"></div>
     </div>
+    <div class="card" id="copyCard">
+      <div class="secttitle">Copyability — could a real bot execute this?</div>
+      <div class="kpis" id="copyKpis"></div>
+      <div class="note" id="copyNote"></div>
+    </div>
     <div class="card">
       <div class="secttitle">Result (with your settings)</div>
       <div class="kpis" id="kpis"></div>
@@ -175,7 +180,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 19</span>
+    <br><span style="opacity:.6">version 20</span>
   </div>
 </div>
 
@@ -240,6 +245,7 @@ async function run(){
     res.partial = partial;
     res.tradesLoaded = trades.length;
     res.ratio = params.ratio;
+    res.copyability = copyability(trades, marketMap, params.ratio);
     res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
     res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
     render(res, params);
@@ -616,6 +622,62 @@ function benchmarkTraderPnl(trades, marketMap){
   return sumPositionsPnl(sim, marketMap);
 }
 
+// ---- Copyability: could a real copy bot have executed these trades? ----
+function median(arr){
+  if(!arr.length) return null;
+  const s = arr.slice().sort((a,b)=>a-b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
+}
+
+function copyability(trades, marketMap, ratio){
+  const spanDays = Math.max(1, (trades[trades.length-1].ts - trades[0].ts)/86400);
+  const perDay = trades.length / spanDays;
+
+  // median market lifetime: his first trade in a market -> its resolution
+  const firstIn = {};
+  for(const t of trades) if(firstIn[t.conditionId] == null) firstIn[t.conditionId] = t.ts;
+  const lifetimes = [];
+  for(const cond in firstIn){
+    const m = marketMap[cond];
+    if(m && m.closed && m.resolveTs > firstIn[cond]) lifetimes.push(m.resolveTs - firstIn[cond]);
+  }
+  const lifeSec = median(lifetimes);
+
+  // adverse price drift between his consecutive fills in the same asset (30s..30min apart)
+  const lastByAsset = {};
+  const drifts = [];
+  for(const t of trades){
+    const prev = lastByAsset[t.asset];
+    if(prev && prev.price > 0){
+      const gap = t.ts - prev.ts;
+      if(gap >= 30 && gap <= 1800){
+        drifts.push(prev.side === "BUY" ? (t.price - prev.price)/prev.price
+                                        : (prev.price - t.price)/prev.price);
+      }
+    }
+    lastByAsset[t.asset] = t;
+  }
+  const drift = drifts.length >= 10 ? median(drifts) : null;
+
+  // your typical copy order in dollars
+  const orderUsd = (median(trades.map(t => t.size * t.price)) || 0) * ratio;
+
+  // traffic lights: 0 = green, 1 = yellow, 2 = red
+  const freqLevel  = perDay <= 50 ? 0 : perDay <= 500 ? 1 : 2;
+  const lifeLevel  = lifeSec == null ? 1 : lifeSec >= 86400 ? 0 : lifeSec >= 3600 ? 1 : 2;
+  const driftLevel = drift == null ? 1 : drift < 0.01 ? 0 : drift <= 0.03 ? 1 : 2;
+  const sizeLevel  = orderUsd <= 200 ? 0 : 1;
+
+  let verdict, verdictLevel;
+  if(freqLevel === 2 || lifeLevel === 2){ verdict = "Not copyable in practice"; verdictLevel = 2; }
+  else if(driftLevel === 2){ verdict = "Only with high slippage tolerance"; verdictLevel = 2; }
+  else if(freqLevel + lifeLevel + driftLevel + sizeLevel > 0){ verdict = "Copyable with care"; verdictLevel = 1; }
+  else { verdict = "Technically copyable"; verdictLevel = 0; }
+
+  return { perDay, lifeSec, drift, driftSamples: drifts.length, orderUsd,
+           freqLevel, lifeLevel, driftLevel, sizeLevel, verdict, verdictLevel };
+}
+
 // ---- Render ----
 function render(r){
   $("results").classList.remove("hidden");
@@ -634,6 +696,34 @@ function render(r){
     `;
   } else {
     $("compareCard").classList.add("hidden");
+  }
+
+  // copyability card
+  if(r.copyability){
+    const c = r.copyability;
+    const lv = l => l === 0 ? "pos" : l === 1 ? "" : "neg";
+    const lifeTxt = c.lifeSec == null ? "unknown"
+      : c.lifeSec >= 86400 ? (c.lifeSec/86400).toFixed(1) + " days"
+      : c.lifeSec >= 3600 ? (c.lifeSec/3600).toFixed(1) + " hours"
+      : Math.round(c.lifeSec/60) + " min";
+    const driftTxt = c.drift == null ? "not enough data"
+      : (c.drift*100).toFixed(2) + "%";
+    $("copyCard").classList.remove("hidden");
+    $("copyKpis").innerHTML = `
+      ${kpi("Verdict", c.verdict, lv(c.verdictLevel))}
+      ${kpi("His trades per day", c.perDay.toFixed(1), lv(c.freqLevel))}
+      ${kpi("Median market lifetime", lifeTxt, lv(c.lifeLevel))}
+      ${kpi("Price drift after his fills", driftTxt, lv(c.driftLevel))}
+      ${kpi("Your typical order", fmtUSD(c.orderUsd), lv(c.sizeLevel))}
+    `;
+    $("copyNote").innerHTML =
+      "<b>Price drift</b> = median price move between his trades in the same market 30s–30min apart" +
+      (c.drift != null ? ` (${c.driftSamples} samples)` : "") +
+      " — a realistic estimate of the copy-lag cost. Use it as your slippage setting. " +
+      "<b>Market lifetime</b> = how long his markets stay alive after he enters: minutes = a bot can't catch them, days = easy. " +
+      "<b>Your typical order</b> = his median trade × your ratio: small orders almost always get filled.";
+  } else {
+    $("copyCard").classList.add("hidden");
   }
   const pf = r.profitFactor === Infinity ? "∞" : r.profitFactor.toFixed(2);
   const wr = r.winRate == null ? "—" : (r.winRate*100).toFixed(0)+"%";

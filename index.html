@@ -142,12 +142,60 @@
     </div>
 
     <button id="run" type="button">Run backtest</button>
-    <button id="scanBtn" class="secondary" type="button">Scan top 10 leaderboard traders</button>
+
+    <div class="row" style="margin-top:14px">
+      <div>
+        <label for="scanWindow">Leaderboard ranks</label>
+        <select id="scanWindow">
+          <option value="1" selected>Top 10 (1–10)</option>
+          <option value="11">11–20</option>
+          <option value="21">21–30</option>
+          <option value="31">31–40</option>
+          <option value="41">41–50</option>
+        </select>
+      </div>
+      <div>
+        <label for="scanOrder">Rank by</label>
+        <select id="scanOrder">
+          <option value="PNL" selected>Profit (biggest win)</option>
+          <option value="VOL">Volume</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="scanCategory">Category</label>
+        <select id="scanCategory">
+          <option value="OVERALL" selected>Overall</option>
+          <option value="POLITICS">Politics</option>
+          <option value="SPORTS">Sports</option>
+          <option value="CRYPTO">Crypto</option>
+          <option value="ECONOMICS">Economics</option>
+          <option value="TECH">Tech</option>
+          <option value="FINANCE">Finance</option>
+          <option value="CULTURE">Culture</option>
+          <option value="MENTIONS">Mentions</option>
+          <option value="WEATHER">Weather</option>
+          <option value="ESPORTS">Esports</option>
+        </select>
+      </div>
+      <div>
+        <label for="scanPeriod">Leaderboard period</label>
+        <select id="scanPeriod">
+          <option value="" selected>Auto (from look-back)</option>
+          <option value="DAY">Day</option>
+          <option value="WEEK">Week</option>
+          <option value="MONTH">Month</option>
+          <option value="ALL">All-time</option>
+        </select>
+      </div>
+    </div>
+    <button id="scanBtn" class="secondary" type="button">Scan these 10 leaderboard traders</button>
     <div class="status" id="status"></div>
   </div>
 
   <div class="card hidden" id="scanCard">
-    <div class="secttitle">Leaderboard scan — top traders by profit, backtested with your settings</div>
+    <div class="secttitle" id="scanTitle">Leaderboard scan — top traders by profit, backtested with your settings</div>
     <div class="scroll"><table id="scanTbl"></table></div>
     <div class="note" id="scanNote"></div>
   </div>
@@ -191,7 +239,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 21</span>
+    <br><span style="opacity:.6">version 22</span>
   </div>
 </div>
 
@@ -376,31 +424,46 @@ async function fetchViaTrades(wallet, cutoff, proxy){
 }
 
 // ---- Leaderboard scan ----
-const SCAN_ORDER = "PNL";   // ranking criterion (change to "VOL" for volume leaders)
 const SCAN_COUNT = 10;
 
 const periodForDays = d => d <= 1 ? "DAY" : d <= 7 ? "WEEK" : d <= 30 ? "MONTH" : "ALL";
 
-async function fetchLeaderboard(days, proxy){
-  const url = `${API_BASE}/v1/leaderboard?category=OVERALL&timePeriod=${periodForDays(days)}`
-            + `&orderBy=${SCAN_ORDER}&limit=${SCAN_COUNT}`;
+async function fetchLeaderboard(days, proxy, opts){
+  opts = opts || {};
+  const period = opts.period || periodForDays(days);          // "" from the picker -> auto
+  const order = opts.order || "PNL";
+  const category = opts.category || "OVERALL";
+  const windowStart = Math.max(1, opts.windowStart || 1);     // 1, 11, 21, 31, 41
+  const limit = Math.min(50, windowStart + SCAN_COUNT - 1);   // fetch up to the window end (API max 50)
+  const url = `${API_BASE}/v1/leaderboard?category=${category}&timePeriod=${period}`
+            + `&orderBy=${order}&limit=${limit}`;
   const arr = await getJSON(url, proxy);
-  return arr.map(t => ({
-    wallet: String(t.proxyWallet || t.wallet || "").toLowerCase(),
-    name: t.userName || t.name || t.pseudonym || "(no name)",
-    pnl: num(t.pnl || 0)
-  })).filter(t => /^0x[0-9a-f]{40}$/.test(t.wallet));
+  return arr
+    .slice(windowStart - 1, windowStart - 1 + SCAN_COUNT)      // the chosen 10
+    .map(t => ({
+      wallet: String(t.proxyWallet || t.wallet || "").toLowerCase(),
+      name: t.userName || t.name || t.pseudonym || "(no name)",
+      pnl: num(t.pnl || 0)
+    })).filter(t => /^0x[0-9a-f]{40}$/.test(t.wallet));
 }
 
 async function scanLeaderboard(){
   const params = readParams();
   if(params.bankroll<=0){ setStatus("Bankroll must be greater than 0.", true); return; }
+  const opts = {
+    windowStart: parseInt($("scanWindow").value, 10) || 1,
+    order: $("scanOrder").value,
+    category: $("scanCategory").value,
+    period: $("scanPeriod").value
+  };
+  const rankLabel = `ranks ${opts.windowStart}–${opts.windowStart+9} by ${opts.order==="VOL"?"Volume":"Profit"}`
+    + `, ${opts.category[0]+opts.category.slice(1).toLowerCase()}, ${opts.period || periodForDays(params.days)}`;
   $("run").disabled = true; $("scanBtn").disabled = true;
   $("results").classList.add("hidden"); $("scanCard").classList.add("hidden");
   try{
-    setStatus("Fetching leaderboard…");
-    const traders = await fetchLeaderboard(params.days, params.proxy);
-    if(traders.length === 0){ setStatus("Leaderboard returned no traders.", true); return; }
+    setStatus(`Fetching leaderboard (${rankLabel})…`);
+    const traders = await fetchLeaderboard(params.days, params.proxy, opts);
+    if(traders.length === 0){ setStatus("Leaderboard returned no traders for that selection.", true); return; }
     const endAnchor = Math.floor(Date.now()/1000/300)*300;
     const cutoff = endAnchor - params.days*86400;
     const rows = [];
@@ -422,8 +485,8 @@ async function scanLeaderboard(){
         rows.push({name:t.name, wallet:t.wallet, failed:true});
       }
     }
-    renderScan(rows, params);
-    setStatus(`Scan done — ${rows.filter(r=>!r.failed&&!r.empty).length} of ${traders.length} traders analyzed. Tap "Load" on a row for the full detailed backtest.`);
+    renderScan(rows, params, rankLabel);
+    setStatus(`Scan done — ${rows.filter(r=>!r.failed&&!r.empty).length} of ${traders.length} traders analyzed (${rankLabel}). Tap "Load" on a row for the full detailed backtest.`);
   }catch(e){
     console.error(e);
     setStatus("Scan error: " + e.message + (params.proxy ? "" :
@@ -433,12 +496,13 @@ async function scanLeaderboard(){
   }
 }
 
-function renderScan(rows, params){
+function renderScan(rows, params, rankLabel){
   const ok = rows.filter(r => !r.failed && !r.empty).sort((a,b) => b.netPnl - a.netPnl);
   const bad = rows.filter(r => r.failed || r.empty);
   const cls = n => n>=0 ? "pos" : "neg";
   const vCls = l => l === 0 ? "pos" : l === 1 ? "" : "neg";
   $("scanCard").classList.remove("hidden");
+  if(rankLabel) $("scanTitle").textContent = "Leaderboard scan — " + rankLabel + ", backtested with your settings";
   $("scanTbl").innerHTML =
     "<tr><th></th><th>Trader</th><th>Your P&L</th><th>ROI</th><th>Win</th><th>PF</th><th>Top ev.</th><th>Copyable?</th></tr>" +
     ok.map((r,i) => `<tr>

@@ -70,7 +70,8 @@
 <div class="wrap">
   <h1>📈 Polymarket Copy-Trade Backtester</h1>
   <p class="sub">Pick a trader's wallet, a look-back window and a bankroll. The tool replays
-  their real trades, copies each one at your chosen ratio, applies fees + copy-lag slippage,
+  their real trades, copies each one at your chosen size — a ratio of his, or a flat $ per market —
+  applies fees + copy-lag slippage,
   exits when they exit, and tells you whether copying them would have made money.</p>
 
   <div class="card">
@@ -101,10 +102,29 @@
 
     <div class="row">
       <div>
+        <label for="sizeMode">How you size each copy</label>
+        <select id="sizeMode">
+          <option value="ratio" selected>Ratio of his size</option>
+          <option value="fixed">Fixed $ per market</option>
+        </select>
+      </div>
+      <div id="ratioBox">
         <label for="ratio">Copy ratio</label>
         <input id="ratio" type="number" inputmode="decimal" value="0.1" min="0" step="0.01" />
         <div class="hint">Share of his size you copy. 0.1 = 10% of every trade.</div>
       </div>
+      <div id="fixedBox" class="hidden">
+        <label for="fixedUsd">Fixed $ per market</label>
+        <input id="fixedUsd" type="number" inputmode="decimal" value="1" min="0" step="0.01" />
+        <div class="hint">Same amount on every market, whatever he bets.</div>
+      </div>
+    </div>
+    <div class="hint hidden" id="fixedNote">
+      One budget per market — "who wins?" and "first scorer?" in the same match each get their own $1.
+      Yes and No on the same market share it. Extra buys are skipped until he sells; any sell re-arms the full amount.
+    </div>
+
+    <div class="row">
       <div>
         <label for="slip">Slippage %</label>
         <input id="slip" type="number" inputmode="decimal" value="1" min="0" step="0.1" />
@@ -239,7 +259,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 22</span>
+    <br><span style="opacity:.6">version 23</span>
   </div>
 </div>
 
@@ -260,11 +280,20 @@ $("advBtn").onclick = () => {
 $("run").onclick = run;
 $("scanBtn").onclick = scanLeaderboard;
 
+$("sizeMode").onchange = () => {
+  const fixed = $("sizeMode").value === "fixed";
+  $("ratioBox").classList.toggle("hidden", fixed);
+  $("fixedBox").classList.toggle("hidden", !fixed);
+  $("fixedNote").classList.toggle("hidden", !fixed);
+};
+
 function readParams(){
   return {
     days: parseInt($("lookback").value,10),
     bankroll: Math.max(0, parseFloat($("bankroll").value)||0),
     ratio: Math.max(0, parseFloat($("ratio").value)||0),
+    sizeMode: $("sizeMode").value,                          // "ratio" | "fixed"
+    fixedUsd: Math.max(0, parseFloat($("fixedUsd").value)||0),
     slip: Math.max(0, parseFloat($("slip").value)||0)/100,
     fee: Math.max(0, parseFloat($("feecat").value)||0),   // base rate: fee = shares × rate × p × (1−p)
     cashPolicy: $("cash").value,
@@ -285,9 +314,12 @@ function analyze(trades, marketMap, params){
   }
   res.tradesLoaded = trades.length;
   res.ratio = params.ratio;
-  res.copyability = copyability(trades, marketMap, params.ratio);
+  res.sizeMode = params.sizeMode;
+  res.fixedUsd = params.fixedUsd;
+  res.copyability = copyability(trades, marketMap, params);
   res.traderPnl = benchmarkTraderPnl(trades, marketMap);   // his P&L on the same trades
-  res.expectedPnl = res.traderPnl * params.ratio;          // a perfect, cost-free copy = his × your ratio
+  // "his × your ratio" only means something when you size proportionally
+  res.expectedPnl = params.sizeMode === "fixed" ? null : res.traderPnl * params.ratio;
   return res;
 }
 
@@ -519,7 +551,7 @@ function renderScan(rows, params, rankLabel){
       <td colspan="6" class="neg">${r.empty ? "no trades in window" : "failed to load"}</td></tr>`).join("");
   $("scanNote").textContent =
     "Quick scan: each trader capped at their most recent 3000 trades (⚠ = capped, period shorter than selected). " +
-    "Sorted by your P&L with your current settings (bankroll, ratio, costs). Tap Load for the exact full backtest.";
+    "Sorted by your P&L with your current settings (bankroll, sizing, costs). Tap Load for the exact full backtest.";
   document.querySelectorAll("#scanTbl .loadBtn").forEach(b => b.onclick = () => {
     $("wallet").value = b.dataset.w;
     $("scanCard").classList.add("hidden");
@@ -551,6 +583,11 @@ function normalize(t){
 // ---- Simulation: replay his trades, copy each one ----
 function simulate(trades, p, marketMap){
   let cash = p.bankroll, copied = 0, skipped = 0, capped = 0, fees = 0, slip = 0, noHold = 0, settledCount = 0;
+  // fixed-$ mode: one budget per market (conditionId), shared by its Yes/No tokens.
+  // Spend accumulates until he sells anything in that market — any sell re-arms the full amount.
+  const fixedMode = p.sizeMode === "fixed";
+  const spentByMkt = {};
+  let budgetCapped = 0;                     // buys not copied because this market's $ was already committed
   const pos = {};          // asset -> position object
   const traderShares = {}; // asset -> running trader share count (to mirror exit fractions)
   const log = [];
@@ -606,7 +643,17 @@ function simulate(trades, p, marketMap){
     if(tr.side === "BUY"){
       const fill = clampPrice(tr.price * (1 + p.slip));
       const feePer = p.fee * fill * (1 - fill);              // Polymarket taker fee per share: rate × p × (1−p)
-      let shares = tr.size * p.ratio;
+      let shares;
+      if(fixedMode){
+        const budget = p.fixedUsd - (spentByMkt[tr.conditionId] || 0);
+        if(budget <= 1e-9){                                  // this market's money is already in play
+          budgetCapped++; traderShares[a] = (traderShares[a]||0) + tr.size;
+          curve.push({ts:tr.ts, equity:markEquity()}); continue;
+        }
+        shares = budget / (fill + feePer);                   // spend exactly the remaining budget, fee included
+      } else {
+        shares = tr.size * p.ratio;
+      }
       let cost = shares * fill, fee = shares * feePer;
       if(cost + fee > cash){
         if(p.cashPolicy === "skip" || cash <= 0){
@@ -617,6 +664,7 @@ function simulate(trades, p, marketMap){
         cost = shares * fill; fee = shares * feePer; capped++;
       }
       cash -= cost + fee;
+      if(fixedMode) spentByMkt[tr.conditionId] = (spentByMkt[tr.conditionId] || 0) + cost + fee;
       ps.shares += shares; ps.basis += cost + fee; ps.invested += cost + fee; ps.bought += shares; ps.buys++;
       fees += fee; slip += shares * (fill - tr.price);
       traderShares[a] = (traderShares[a]||0) + tr.size;
@@ -627,16 +675,19 @@ function simulate(trades, p, marketMap){
       const have = ps.shares;
       if(have <= 1e-9){
         noHold++;                                 // he sold something we never bought (no cash, or bought pre-window)
+        if(fixedMode) spentByMkt[tr.conditionId] = 0;        // he sold — the budget is re-armed either way
         traderShares[a] = Math.max(0, before - tr.size);
         curve.push({ts:tr.ts, equity:markEquity()}); continue;
       }
-      const sellShares = before > 1e-9 ? have * Math.min(1, tr.size/before) : Math.min(have, tr.size * p.ratio);
+      const sellShares = before > 1e-9 ? have * Math.min(1, tr.size/before)
+                       : (fixedMode ? have : Math.min(have, tr.size * p.ratio));
       const fill = clampPrice(tr.price * (1 - p.slip));
       const proceeds = sellShares * fill, fee = sellShares * p.fee * fill * (1 - fill);   // taker fee on sells too
       const costPortion = ps.basis * (sellShares / have);
       const realized = (proceeds - fee) - costPortion;              // result of this sell vs cost of the shares sold
       if(realized > 1e-9) ps.wTrades++; else if(realized < -1e-9) ps.lTrades++;
       cash += proceeds - fee;
+      if(fixedMode) spentByMkt[tr.conditionId] = 0;          // any sell (partial or full) re-arms the full amount
       ps.shares -= sellShares; ps.basis -= costPortion; ps.returned += proceeds - fee; ps.sells++;
       fees += fee; slip += sellShares * (tr.price - fill);
       traderShares[a] = Math.max(0, before - tr.size);
@@ -648,7 +699,7 @@ function simulate(trades, p, marketMap){
   }
 
   return { startBankroll:p.bankroll, cash, positions:Object.values(pos),
-           curve, log, copied, skipped, capped, fees, slip, noHold, settledCount };
+           curve, log, copied, skipped, capped, budgetCapped, fees, slip, noHold, settledCount };
 }
 
 // ---- Look up each market's resolution / live price (Gamma API) ----
@@ -761,6 +812,7 @@ function finalize(sim, p, marketMap){
     startBankroll: sim.startBankroll, endingEquity, cash, openValue,
     netPnl: endingEquity - sim.startBankroll, roi: (endingEquity - sim.startBankroll)/sim.startBankroll,
     copied: sim.copied, skipped: sim.skipped, capped: sim.capped, noHold: sim.noHold,
+    budgetCapped: sim.budgetCapped,
     fees: sim.fees, slip: sim.slip, costDrag: sim.fees + sim.slip,
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
@@ -803,7 +855,7 @@ function median(arr){
   return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
 }
 
-function copyability(trades, marketMap, ratio){
+function copyability(trades, marketMap, p){
   const spanDays = Math.max(1, (trades[trades.length-1].ts - trades[0].ts)/86400);
   const perDay = trades.length / spanDays;
 
@@ -834,7 +886,9 @@ function copyability(trades, marketMap, ratio){
   const drift = drifts.length >= 10 ? median(drifts) : null;
 
   // your typical copy order in dollars
-  const orderUsd = (median(trades.map(t => t.size * t.price)) || 0) * ratio;
+  const orderUsd = p.sizeMode === "fixed"
+    ? p.fixedUsd                                            // flat sizing: every order is the same
+    : (median(trades.map(t => t.size * t.price)) || 0) * p.ratio;
 
   // traffic lights: 0 = green, 1 = yellow, 2 = red
   const freqLevel  = perDay <= 50 ? 0 : perDay <= 500 ? 1 : 2;
@@ -915,7 +969,9 @@ function render(r){
     ${kpi("Fees + slippage", fmtUSD(r.costDrag), "neg")}
     ${kpi("Ending bankroll", fmtUSD(r.endingEquity), cls(r.netPnl))}
     ${kpi("Trader P&L (full size)", fmtUSD(r.traderPnl), cls(r.traderPnl))}
-    ${kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
+    ${r.expectedPnl == null
+        ? kpi(`Flat ${fmtUSD(r.fixedUsd)} per market`, r.copied + " copied", "")
+        : kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
     ${kpi("Top event share of profit", r.topShare == null ? "—" : Math.round(r.topShare*100)+"%",
           r.topShare != null && r.topShare > 0.5 ? "neg" : "pos")}
     ${kpi("Top 3 events share", r.top3Share == null ? "—" : Math.round(r.top3Share*100)+"%",
@@ -948,6 +1004,18 @@ function render(r){
   }
 
   // benchmark check: with no costs and no skipped trades, your P&L should equal his × ratio
+  if(r.expectedPnl == null){
+    // flat sizing — his result and yours are not supposed to line up; that is the whole point
+    $("benchmark").innerHTML =
+      `<b>Check:</b> the trader made <b>${fmtUSD(r.traderPnl)}</b> on these trades at his own size. ` +
+      `You put a flat <b>${fmtUSD(r.fixedUsd)}</b> on each market and got ` +
+      `<b class="${cls(r.netPnl)}">${fmtUSD(r.netPnl)}</b>. ` +
+      `These are <i>not</i> meant to match — flat sizing deliberately ignores how much he bet, so his ` +
+      `big positions no longer carry the result. ` +
+      `You copied <b>${r.copied}</b> trade(s)` +
+      (r.budgetCapped ? `, and skipped <b>${r.budgetCapped}</b> repeat buy(s) where that market's ${fmtUSD(r.fixedUsd)} was already in play` : "") +
+      (r.skipped ? `, and skipped <b>${r.skipped}</b> buy(s) for lack of cash` : "") + `.`;
+  } else {
   const diff = r.netPnl - r.expectedPnl;
   const close = Math.abs(diff) <= Math.max(0.5, Math.abs(r.expectedPnl)*0.02);
   $("benchmark").innerHTML =
@@ -957,6 +1025,7 @@ function render(r){
     (close
       ? `✅ Matches — the copy is faithful.`
       : `Difference of ${fmtUSD(diff)} comes from ${r.skipped?`${r.skipped} skipped buy(s) (cash-out), `:""}${r.costDrag>0.005?"fees/slippage, ":""}and sells you couldn't mirror. Raise the bankroll (or lower the ratio) and set fees/slippage to 0 to make it match exactly.`);
+  }
 
   // per-market results (the positions you copied)
   const badge = s => s==="resolved" ? `<span class="tag tWIN">settled</span>`
@@ -994,7 +1063,8 @@ function render(r){
   if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
   if(r.openCount) parts.push(`${r.openCount} market(s) still open (not yet resolved) — their P&L is an estimate at the live price and is excluded from win rate.`);
   if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced individually, so they're valued at the last traded price.`);
-  if(r.skipped) parts.push(`${r.skipped} buy(s) skipped — you ran out of cash (raise bankroll or lower copy ratio to copy more).`);
+  if(r.skipped) parts.push(`${r.skipped} buy(s) skipped — you ran out of cash (raise bankroll or lower your copy size).`);
+  if(r.budgetCapped) parts.push(`${r.budgetCapped} repeat buy(s) not copied — that market's ${fmtUSD(r.fixedUsd)} was already in play; it re-arms once he sells.`);
   if(r.capped) parts.push(`${r.capped} buy(s) only partially filled (cash-capped).`);
   if(r.noHold) parts.push(`${r.noHold} sell(s) skipped — he sold positions you weren't holding (entered before the window, or you'd skipped the buy).`);
   if(r.topEvent && r.topShare != null){

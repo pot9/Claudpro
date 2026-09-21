@@ -147,6 +147,16 @@
           <div class="hint">Real Polymarket taker fee: shares × rate × price × (1−price), charged on buys and sells. Settlement is free.</div>
         </div>
         <div>
+          <label for="tick">Minimum slippage (tick size)</label>
+          <select id="tick">
+            <option value="0.01" selected>1 cent — realistic (book moves in whole cents)</option>
+            <option value="0.001">0.1 cent — fine-tick markets only</option>
+            <option value="0">None — percentage only (optimistic)</option>
+          </select>
+          <div class="hint">On a 1¢ market a single tick is a 100% move, so a percentage alone
+            massively understates the cost of copying cheap longshots.</div>
+        </div>
+        <div>
           <label for="cash">Cash policy</label>
           <select id="cash">
             <option value="partial" selected>Partial fill if short on cash</option>
@@ -259,7 +269,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 27</span>
+    <br><span style="opacity:.6">version 28</span>
   </div>
 </div>
 
@@ -271,6 +281,15 @@ const API_BASE = "https://data-api.polymarket.com";
 const fmtUSD = n => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maximumFractionDigits:2,minimumFractionDigits:2});
 const fmtPct = n => (n>=0?"+":"") + (n*100).toFixed(2) + "%";
 const clampPrice = p => Math.min(0.999, Math.max(0.001, p));
+
+// Copy-lag fill price. A percentage alone is unrealistic on cheap markets: the book moves in
+// whole ticks, so the smallest adverse move at 1¢ is 1¢ → 2¢ (+100%), not +1%. Take whichever
+// is worse — the percentage, or one tick.
+function fillPrice(price, slipPct, tick, dir){
+  const pct = price * (1 + dir*slipPct);
+  const tk  = price + dir*(tick || 0);
+  return clampPrice(dir > 0 ? Math.max(pct, tk) : Math.min(pct, tk));
+}
 
 $("advBtn").onclick = () => {
   const b = $("advBox"); b.classList.toggle("open");
@@ -297,6 +316,7 @@ function readParams(){
     slip: Math.max(0, parseFloat($("slip").value)||0)/100,
     fee: Math.max(0, parseFloat($("feecat").value)||0),   // base rate: fee = shares × rate × p × (1−p)
     cashPolicy: $("cash").value,
+    tick: Math.max(0, parseFloat($("tick").value)||0),
     proxy: $("proxy").value.trim()
   };
 }
@@ -306,8 +326,8 @@ function analyze(trades, marketMap, params){
   const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
   const res = finalize(sim, params, marketMap);
   // second run with zero costs, same everything else — for the comparison
-  if(params.slip > 0 || params.fee > 0){
-    const pIdeal = Object.assign({}, params, {slip:0, fee:0});
+  if(params.slip > 0 || params.fee > 0 || params.tick > 0){
+    const pIdeal = Object.assign({}, params, {slip:0, fee:0, tick:0});
     res.ideal = finalize(simulate(trades, pIdeal, marketMap), pIdeal, marketMap);
   } else {
     res.ideal = null;   // settings already have no costs — nothing to compare
@@ -703,7 +723,7 @@ function simulate(trades, p, marketMap){
     if(tr.ts > ps.lastTs) ps.lastTs = tr.ts;
 
     if(tr.side === "BUY"){
-      const fill = clampPrice(tr.price * (1 + p.slip));
+      const fill = fillPrice(tr.price, p.slip, p.tick, +1);
       const feePer = p.fee * fill * (1 - fill);              // Polymarket taker fee per share: rate × p × (1−p)
       let shares;
       if(fixedMode){
@@ -743,7 +763,7 @@ function simulate(trades, p, marketMap){
       }
       const sellShares = before > 1e-9 ? have * Math.min(1, tr.size/before)
                        : (fixedMode ? have : Math.min(have, tr.size * p.ratio));
-      const fill = clampPrice(tr.price * (1 - p.slip));
+      const fill = fillPrice(tr.price, p.slip, p.tick, -1);
       const proceeds = sellShares * fill, fee = sellShares * p.fee * fill * (1 - fill);   // taker fee on sells too
       const costPortion = ps.basis * (sellShares / have);
       const realized = (proceeds - fee) - costPortion;              // result of this sell vs cost of the shares sold
@@ -956,7 +976,7 @@ function sumPositionsPnl(sim, marketMap){
 
 // The trader's own P&L on these same trades: full size (ratio 1), unlimited bankroll, no costs.
 function benchmarkTraderPnl(trades, marketMap){
-  const sim = simulate(trades, {bankroll: 1e15, ratio: 1, slip: 0, fee: 0, cashPolicy: "partial"}, marketMap);
+  const sim = simulate(trades, {bankroll: 1e15, ratio: 1, slip: 0, fee: 0, tick: 0, cashPolicy: "partial"}, marketMap);
   return sumPositionsPnl(sim, marketMap);
 }
 
@@ -1108,7 +1128,13 @@ function render(r){
         avg entry ${(avgEntry*100).toFixed(0)}¢/share
         <br><i>${oneShot
           ? "⚠️ One-shot bet: bought once and waited — a single call, not a built position."
-          : "Position built across multiple trades/days — deliberate, not a single lucky click."}</i>
+          : days <= 1
+            ? `⚠️ All ${g.buys} buys landed inside one day — one burst on one story, not conviction built over time.`
+            : `Position built across ${g.buys} buys over ${days} days — deliberate, not a single lucky click.`}</i>${
+          avgEntry > 0 && avgEntry < 0.05
+            ? `<br><i>⚠️ Entered at ${(avgEntry*100).toFixed(0)}¢ — a longshot. At this price one tick of
+               copy lag roughly halves your payout, so treat this profit as a best case.</i>`
+            : ""}
       </div>`;
     }).join("");
   } else {

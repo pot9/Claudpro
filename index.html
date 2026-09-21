@@ -259,7 +259,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 26</span>
+    <br><span style="opacity:.6">version 27</span>
   </div>
 </div>
 
@@ -1084,9 +1084,9 @@ function render(r){
     ${r.expectedPnl == null
         ? kpi(`Flat ${fmtUSD(r.fixedUsd)} per market`, r.copied + " copied", "")
         : kpi(`Perfect copy ×${r.ratio}`, fmtUSD(r.expectedPnl), cls(r.expectedPnl))}
-    ${kpi("Top event share of profit", r.topShare == null ? "—" : Math.round(r.topShare*100)+"%",
+    ${kpi("Top event share of YOUR profit", r.topShare == null ? "—" : Math.round(r.topShare*100)+"%",
           r.topShare != null && r.topShare > 0.5 ? "neg" : "pos")}
-    ${kpi("Top 3 events share", r.top3Share == null ? "—" : Math.round(r.top3Share*100)+"%",
+    ${kpi("Top 3 events share of YOUR profit", r.top3Share == null ? "—" : Math.round(r.top3Share*100)+"%",
           r.top3Share != null && r.top3Share > 0.8 ? "neg" : "pos")}
   `;
   drawChart(r.curve, r.ideal ? r.ideal.curve : null);
@@ -1187,10 +1187,13 @@ function render(r){
   if(r.noHold) parts.push(`${r.noHold} sell(s) skipped — he sold positions you weren't holding (entered before the window, or you'd skipped the buy).`);
   if(r.topEvent && r.topShare != null){
     const pc = Math.round(r.topShare*100);
-    parts.push(`<b>Diversification:</b> his single best event ("${esc(r.topEvent.title)}") made ${fmtUSD(r.topEvent.pnl)} = <b>${pc}%</b> of the profit, across ${r.eventCount} events. ` +
+    parts.push(`<b>Diversification:</b> your best event ("${esc(r.topEvent.title)}") made <b>you</b> ${fmtUSD(r.topEvent.pnl)} = <b>${pc}%</b> of your profit, across ${r.eventCount} events. ` +
       (r.topShare > 0.5
-        ? "⚠️ Over half the profit is one story — bets on the same event win or lose together, so this result leans on one good call rather than repeatable skill. Test a longer window."
-        : "Profit is reasonably spread across different events — a good sign."));
+        ? "⚠️ Over half of <b>your</b> profit is one story — bets on the same event win or lose together, so this result leans on one good call rather than repeatable skill. Test a longer window."
+          + (r.sizeMode === "fixed"
+              ? " Note this is already measured on your flat-stake copy: equal stakes even out how much you bet, but not what each bet pays — a longshot that lands still returns many times your stake."
+              : " Try the flat $-per-market mode to see how much of this is just his position size.")
+        : "Your profit is reasonably spread across different events — a good sign."));
   }
   parts.push("Win rate, avg win/loss, profit factor and expectancy are computed over decided markets only (sold or resolved).");
   $("caveats").innerHTML = parts.join(" ");

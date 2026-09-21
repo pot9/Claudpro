@@ -149,12 +149,13 @@
         <div>
           <label for="tick">Minimum slippage (tick size)</label>
           <select id="tick">
-            <option value="0.01" selected>1 cent — realistic (book moves in whole cents)</option>
-            <option value="0.001">0.1 cent — fine-tick markets only</option>
+            <option value="auto" selected>Auto — Polymarket's real rule</option>
+            <option value="0.01">Always 1 cent — pessimistic</option>
+            <option value="0.001">Always 0.1 cent</option>
             <option value="0">None — percentage only (optimistic)</option>
           </select>
-          <div class="hint">On a 1¢ market a single tick is a 100% move, so a percentage alone
-            massively understates the cost of copying cheap longshots.</div>
+          <div class="hint">The book moves in whole ticks: $0.01 normally, but $0.001 below 4¢
+            or above 96¢. A percentage alone understates what copying actually costs.</div>
         </div>
         <div>
           <label for="cash">Cash policy</label>
@@ -269,7 +270,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 28</span>
+    <br><span style="opacity:.6">version 29</span>
   </div>
 </div>
 
@@ -282,12 +283,17 @@ const fmtUSD = n => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maxim
 const fmtPct = n => (n>=0?"+":"") + (n*100).toFixed(2) + "%";
 const clampPrice = p => Math.min(0.999, Math.max(0.001, p));
 
-// Copy-lag fill price. A percentage alone is unrealistic on cheap markets: the book moves in
-// whole ticks, so the smallest adverse move at 1¢ is 1¢ → 2¢ (+100%), not +1%. Take whichever
-// is worse — the percentage, or one tick.
-function fillPrice(price, slipPct, tick, dir){
+// Polymarket's tick is $0.01 normally, but tightens to $0.001 in the tails — below $0.04
+// or above $0.96 — so cheap longshots trade in tenths of a cent (1.1¢, 1.2¢ …).
+const tickFor = price => (price < 0.04 || price > 0.96) ? 0.001 : 0.01;
+
+// Copy-lag fill price. A percentage alone understates the cost on cheap markets, because the
+// book only moves in whole ticks. Take whichever is worse — the percentage, or one tick.
+// tickMode: "auto" follows the rule above, a number forces that tick, 0 disables it.
+function fillPrice(price, slipPct, tickMode, dir){
+  const tick = tickMode === "auto" ? tickFor(price) : (parseFloat(tickMode) || 0);
   const pct = price * (1 + dir*slipPct);
-  const tk  = price + dir*(tick || 0);
+  const tk  = price + dir*tick;
   return clampPrice(dir > 0 ? Math.max(pct, tk) : Math.min(pct, tk));
 }
 
@@ -316,7 +322,7 @@ function readParams(){
     slip: Math.max(0, parseFloat($("slip").value)||0)/100,
     fee: Math.max(0, parseFloat($("feecat").value)||0),   // base rate: fee = shares × rate × p × (1−p)
     cashPolicy: $("cash").value,
-    tick: Math.max(0, parseFloat($("tick").value)||0),
+    tick: $("tick").value === "auto" ? "auto" : Math.max(0, parseFloat($("tick").value)||0),
     proxy: $("proxy").value.trim()
   };
 }
@@ -326,7 +332,7 @@ function analyze(trades, marketMap, params){
   const sim = simulate(trades, params, marketMap);   // resolutions recycle cash during the run
   const res = finalize(sim, params, marketMap);
   // second run with zero costs, same everything else — for the comparison
-  if(params.slip > 0 || params.fee > 0 || params.tick > 0){
+  if(params.slip > 0 || params.fee > 0 || params.tick === "auto" || params.tick > 0){
     const pIdeal = Object.assign({}, params, {slip:0, fee:0, tick:0});
     res.ideal = finalize(simulate(trades, pIdeal, marketMap), pIdeal, marketMap);
   } else {
@@ -1132,8 +1138,9 @@ function render(r){
             ? `⚠️ All ${g.buys} buys landed inside one day — one burst on one story, not conviction built over time.`
             : `Position built across ${g.buys} buys over ${days} days — deliberate, not a single lucky click.`}</i>${
           avgEntry > 0 && avgEntry < 0.05
-            ? `<br><i>⚠️ Entered at ${(avgEntry*100).toFixed(0)}¢ — a longshot. At this price one tick of
-               copy lag roughly halves your payout, so treat this profit as a best case.</i>`
+            ? `<br><i>⚠️ Entered at ${(avgEntry*100).toFixed(0)}¢ — a longshot. Below 4¢ the tick is
+               0.1¢, so one tick of copy lag costs roughly ${Math.round(0.001/avgEntry*100)}% of the
+               payout here; the profit assumes you got filled close to his price.</i>`
             : ""}
       </div>`;
     }).join("");

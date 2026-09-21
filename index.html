@@ -259,7 +259,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 23</span>
+    <br><span style="opacity:.6">version 24</span>
   </div>
 </div>
 
@@ -324,6 +324,7 @@ function analyze(trades, marketMap, params){
 }
 
 async function run(){
+  if(inflight){ requestStop(); return; }               // button is showing "Stop"
   const wallet = $("wallet").value.trim().toLowerCase();
   if(!/^0x[0-9a-f]{40}$/.test(wallet)){
     setStatus("Enter a valid 0x… wallet address.", true); return;
@@ -331,7 +332,8 @@ async function run(){
   const params = readParams();
   if(params.bankroll<=0){ setStatus("Bankroll must be greater than 0.", true); return; }
 
-  $("run").disabled = true; $("results").classList.add("hidden");
+  beginRun();
+  $("results").classList.add("hidden");
   setStatus("Fetching trades…");
   try{
     // Snap the window to a 5-minute boundary so re-runs use the EXACT same window (deterministic).
@@ -340,7 +342,7 @@ async function run(){
     const { trades, truncated, partial } = await fetchTrades(wallet, cutoff, params.proxy, endAnchor);
     if(trades.length === 0){
       setStatus("No trades found for this wallet in the selected window.", true);
-      $("run").disabled = false; return;
+      return;
     }
     const who = (trades.find(t => t.trader) || {}).trader;
     setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Checking how each market resolved…`);
@@ -354,11 +356,12 @@ async function run(){
     const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
     setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.${note}`);
   }catch(e){
+    if(e.__cancelled){ setStatus("Stopped."); return; }
     console.error(e);
     setStatus("Error: " + e.message + (params.proxy ? "" :
       " — if this is a CORS/network block, add a CORS proxy in Advanced settings."), true);
   }finally{
-    $("run").disabled = false;
+    endRun();
   }
 }
 
@@ -385,11 +388,36 @@ async function fetchTrades(wallet, cutoff, proxy, endAnchor){
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ---- Cancellation: the Run button doubles as Stop while a run is in flight ----
+let cancelRun = false, inflight = null;
+class Cancelled extends Error { constructor(){ super("Stopped."); this.__cancelled = true; } }
+function throwIfCancelled(){ if(cancelRun) throw new Cancelled(); }
+function beginRun(){
+  cancelRun = false; inflight = new AbortController();
+  $("run").textContent = "Stop"; $("run").classList.add("secondary");
+  $("scanBtn").disabled = true;
+}
+function endRun(){
+  inflight = null;
+  $("run").textContent = "Run backtest"; $("run").classList.remove("secondary");
+  $("run").disabled = false; $("scanBtn").disabled = false;
+}
+function requestStop(){
+  cancelRun = true;
+  if(inflight) try { inflight.abort(); } catch(e){}
+  setStatus("Stopping…");
+}
+
 async function getJSON(url, proxy, tries = 5){
   for(let i = 0; i < tries; i++){
     let res;
-    try { res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}}); }
-    catch(e){ if(i === tries-1) throw e; await sleep(800*(i+1)); continue; }   // network blip → retry
+    throwIfCancelled();
+    try { res = await fetch(proxy ? proxy + encodeURIComponent(url) : url,
+            {headers:{accept:"application/json"}, signal: inflight ? inflight.signal : undefined}); }
+    catch(e){
+      if(cancelRun || e.name === "AbortError") throw new Cancelled();   // we stopped it on purpose
+      if(i === tries-1) throw e; await sleep(800*(i+1)); continue;      // network blip → retry
+    }
     if(res.ok){
       let data = await res.json();
       if(!Array.isArray(data)) data = data && data.data ? data.data : [];
@@ -403,34 +431,55 @@ async function getJSON(url, proxy, tries = 5){
   }
 }
 
+// Time-cursor pagination: each request returns the next 500 older trades and we move the
+// `end` cursor to the oldest timestamp we saw. One request per 500 trades, no offset walking,
+// and no 3000-trade ceiling — so long windows finish fast AND come back complete.
+const MAX_REQUESTS = 400, MAX_TRADES = 50000;
+
 async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
-  const limit = 500, MAX_OFFSET = 3000, CHUNK = 7*86400;   // request 7 days at a time so the server doesn't time out
+  const limit = 500, MAX_OFFSET = 3000;
   const all = [], seen = new Set();
-  let end = (endAnchor || Math.floor(Date.now()/1000)) + 1, truncated = false, guard = 0;
-  while(end > cutoff && guard++ < 2000){
-    const winStart = Math.max(cutoff, end - CHUNK);
-    let offset = 0, oldest = end, hitCap = false;
-    while(true){
-      if(offset >= MAX_OFFSET){ hitCap = true; break; }
-      const reqLimit = Math.min(limit, MAX_OFFSET - offset);
-      const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${winStart}&end=${end}`
-                + `&limit=${reqLimit}&offset=${offset}&sortDirection=DESC`;
-      const batch = await getJSON(url, proxy);
-      if(batch.length === 0) break;
-      for(const it of batch){
-        const ts = num(it.timestamp || it.time || 0);
-        if(ts < oldest) oldest = ts;
-        const key = (it.transactionHash||"") + "|" + (it.asset||"") + "|" + ts + "|" + (it.side||"") + "|" + (it.size||"");
-        if(!seen.has(key)){ seen.add(key); all.push(it); }
-      }
-      offset += batch.length;
-      if(batch.length < reqLimit) break;
+  const startedAt = (endAnchor || Math.floor(Date.now()/1000)) + 1;
+  const span = Math.max(1, startedAt - cutoff);
+  let cursor = startedAt, truncated = false, requests = 0, offset = 0;
+
+  const add = batch => {
+    let oldest = cursor;
+    for(const it of batch){
+      const ts = num(it.timestamp || it.time || 0);
+      if(ts < oldest) oldest = ts;
+      const key = (it.transactionHash||"") + "|" + (it.asset||"") + "|" + ts + "|" + (it.side||"") + "|" + (it.size||"");
+      if(!seen.has(key)){ seen.add(key); all.push(it); }
     }
-    if(hitCap && oldest < end) end = oldest;          // >3000 in this 7-day window → continue from the oldest seen
-    else if(hitCap){ truncated = true; break; }       // can't make progress (>3000 in one instant)
-    else end = winStart;                              // window done → step back to the previous 7 days
-    setStatus(`Fetching trades… ${all.length} so far`);
+    return oldest;
+  };
+
+  while(cursor > cutoff){
+    throwIfCancelled();
+    if(requests >= MAX_REQUESTS || all.length >= MAX_TRADES){ truncated = true; break; }
+    requests++;
+    const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${cutoff}&end=${cursor}`
+              + `&limit=${limit}&offset=${offset}&sortDirection=DESC`;
+    const batch = await getJSON(url, proxy);
+    if(batch.length === 0) break;                       // nothing older left in the window
+    const oldest = add(batch);
+
+    if(oldest < cursor){
+      cursor = oldest; offset = 0;                      // normal case: step the cursor back
+    } else {
+      // 500+ trades share this exact second — the cursor can't move, so page by offset instead
+      offset += batch.length;
+      if(offset >= MAX_OFFSET){ truncated = true; break; }
+    }
+    if(batch.length < limit && offset === 0) break;     // short page at a fresh cursor = end of data
+
+    const covered = Math.min(1, (startedAt - cursor) / span);
+    setStatus(`Fetching trades… ${all.length.toLocaleString()} so far — back to `
+      + new Date(cursor*1000).toLocaleDateString(undefined,{day:"numeric",month:"short"})
+      + ` (${Math.round(covered*100)}% of the window)`);
+    await sleep(0);                                     // let the browser breathe — never freeze the tab
   }
+
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
   return { trades, truncated };
@@ -441,6 +490,7 @@ async function fetchViaTrades(wallet, cutoff, proxy){
   const limit = 500, MAX_OFFSET = 3000;
   let offset = 0, all = [], guard = 0, reachedCutoff = false, truncated = false;
   while(guard++ < 60){
+    throwIfCancelled();
     if(offset >= MAX_OFFSET){ truncated = true; break; }
     const reqLimit = Math.min(limit, MAX_OFFSET - offset);
     const batch = await getJSON(`${API_BASE}/trades?user=${wallet}&limit=${reqLimit}&offset=${offset}`, proxy);
@@ -449,6 +499,8 @@ async function fetchViaTrades(wallet, cutoff, proxy){
     offset += batch.length;
     if(num(batch[batch.length-1].timestamp) < cutoff){ reachedCutoff = true; break; }
     if(batch.length < reqLimit) break;
+    setStatus(`Fetching trades… ${all.length.toLocaleString()} so far`);
+    await sleep(0);
   }
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
@@ -490,7 +542,7 @@ async function scanLeaderboard(){
   };
   const rankLabel = `ranks ${opts.windowStart}–${opts.windowStart+9} by ${opts.order==="VOL"?"Volume":"Profit"}`
     + `, ${opts.category[0]+opts.category.slice(1).toLowerCase()}, ${opts.period || periodForDays(params.days)}`;
-  $("run").disabled = true; $("scanBtn").disabled = true;
+  beginRun();
   $("results").classList.add("hidden"); $("scanCard").classList.add("hidden");
   try{
     setStatus(`Fetching leaderboard (${rankLabel})…`);
@@ -513,6 +565,7 @@ async function scanLeaderboard(){
           profitFactor:res.profitFactor, topShare:res.topShare,
           verdict:res.copyability.verdict, verdictLevel:res.copyability.verdictLevel });
       }catch(e){
+        if(e.__cancelled) throw e;               // Stop means stop, not "skip this trader"
         console.error(t.name, e);
         rows.push({name:t.name, wallet:t.wallet, failed:true});
       }
@@ -520,11 +573,12 @@ async function scanLeaderboard(){
     renderScan(rows, params, rankLabel);
     setStatus(`Scan done — ${rows.filter(r=>!r.failed&&!r.empty).length} of ${traders.length} traders analyzed (${rankLabel}). Tap "Load" on a row for the full detailed backtest.`);
   }catch(e){
+    if(e.__cancelled){ setStatus("Stopped."); return; }
     console.error(e);
     setStatus("Scan error: " + e.message + (params.proxy ? "" :
       " — if this is a CORS/network block, add a CORS proxy in Advanced settings."), true);
   }finally{
-    $("run").disabled = false; $("scanBtn").disabled = false;
+    endRun();
   }
 }
 
@@ -734,11 +788,25 @@ async function fetchMarketPrices(conditionIds, proxy){
         resolveTs: closed ? toTs(m.closedTime || m.closedTimeIso || m.endDate || m.endDateIso) : 0 };
     }
   };
-  for(let i = 0; i < ids.length; i += CHUNK){
-    const chunk = ids.slice(i, i + CHUNK);
-    try { await grab(chunk, "true"); }  catch(e){ /* ignore */ }
-    try { await grab(chunk, "false"); } catch(e){ /* ignore */ }
-  }
+  // chunks run a few at a time, and each chunk's open+resolved queries go out together
+  const chunks = [];
+  for(let i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
+  const POOL = 5;
+  let next = 0, done = 0;
+  const worker = async () => {
+    while(next < chunks.length){
+      throwIfCancelled();
+      const chunk = chunks[next++];
+      await Promise.all([
+        grab(chunk, "true").catch(()=>{}),
+        grab(chunk, "false").catch(()=>{})
+      ]);
+      done++;
+      setStatus(`Checking how each market resolved… ${Math.min(done*CHUNK, ids.length)}/${ids.length}`);
+      await sleep(0);
+    }
+  };
+  await Promise.all(Array.from({length: Math.min(POOL, chunks.length)}, worker));
   map.__priced = priced; map.__requested = ids.length;
   return map;
 }

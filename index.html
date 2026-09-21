@@ -259,7 +259,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 25</span>
+    <br><span style="opacity:.6">version 26</span>
   </div>
 </div>
 
@@ -339,7 +339,7 @@ async function run(){
     // Snap the window to a 5-minute boundary so re-runs use the EXACT same window (deterministic).
     const endAnchor = Math.floor(Date.now()/1000/300)*300;
     const cutoff = endAnchor - params.days*86400;
-    const { trades, truncated, partial } = await fetchTrades(wallet, cutoff, params.proxy, endAnchor);
+    const { trades, truncated, partial, capReason, coveredFrom } = await fetchTrades(wallet, cutoff, params.proxy, endAnchor);
     if(trades.length === 0){
       setStatus("No trades found for this wallet in the selected window.", true);
       return;
@@ -352,6 +352,9 @@ async function run(){
     const res = analyze(trades, marketMap, params);
     res.truncated = truncated;
     res.partial = partial;
+    res.capReason = capReason;
+    res.coveredDays = coveredFrom ? Math.max(0, Math.round((endAnchor - coveredFrom)/86400)) : null;
+    res.requestedDays = params.days;
     render(res, params);
     const note = truncated ? " (very active trader — capped at his most recent 3000 trades, so the period covered is shorter than selected)" : "";
     setStatus(`Done — replayed ${trades.length} of ${who ? who + "'s" : "his"} trades, copied ${res.copied}.${note}`);
@@ -482,7 +485,11 @@ async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
 
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
-  return { trades, truncated };
+  const capReason = !truncated ? null
+    : all.length >= MAX_TRADES ? `${MAX_TRADES.toLocaleString()}-trade limit`
+    : requests >= MAX_REQUESTS ? `${MAX_REQUESTS}-request limit`
+    : "the API's 3,000-per-timestamp limit";
+  return { trades, truncated, capReason, coveredFrom: trades.length ? trades[0].ts : cutoff };
 }
 
 // Fallback: /trades (no time filter, capped at the most recent 3000)
@@ -504,7 +511,8 @@ async function fetchViaTrades(wallet, cutoff, proxy){
   }
   const trades = all.map(normalize).filter(t => t && t.ts >= cutoff && t.size > 0 && t.asset)
                     .sort((a,b) => a.ts - b.ts);
-  return { trades, truncated: truncated && !reachedCutoff };
+  return { trades, truncated: truncated && !reachedCutoff, capReason: "API's 3,000-trade cap on this endpoint",
+           coveredFrom: trades.length ? trades[0].ts : cutoff };
 }
 
 // ---- Leaderboard scan ----
@@ -1166,7 +1174,11 @@ function render(r){
     parts.push("⚠️ Couldn't reach either market-resolution API (Gamma or CLOB) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
   else if(r.marketsRequested && r.marketsPriced < r.marketsRequested)
     parts.push(`⚠️ Only ${r.marketsPriced} of ${r.marketsRequested} markets could be priced this run; the rest are valued at last traded price. If this count changes between runs, your profit and copied-trade count will change too — re-run until it's stable.`);
-  if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");
+  if(r.truncated) parts.push(`⚠️ Very active trader: the fetch stopped at the ${r.capReason || "data limit"}`
+    + (r.coveredDays != null && r.requestedDays
+        ? `, so this covers roughly his most recent <b>${r.coveredDays} of the ${r.requestedDays} days</b> you asked for`
+        : ", so this covers a shorter period than you selected")
+    + ` and may start mid-position. Shorten the look-back to get a window that fits.`);
   if(r.openCount) parts.push(`${r.openCount} market(s) still open (not yet resolved) — their P&L is an estimate at the live price and is excluded from win rate.`);
   if(r.fallback) parts.push(`${r.fallback} market(s) couldn't be priced individually, so they're valued at the last traded price.`);
   if(r.skipped) parts.push(`${r.skipped} buy(s) skipped — you ran out of cash (raise bankroll or lower your copy size).`);

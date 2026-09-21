@@ -259,7 +259,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 24</span>
+    <br><span style="opacity:.6">version 25</span>
   </div>
 </div>
 
@@ -807,7 +807,42 @@ async function fetchMarketPrices(conditionIds, proxy){
     }
   };
   await Promise.all(Array.from({length: Math.min(POOL, chunks.length)}, worker));
-  map.__priced = priced; map.__requested = ids.length;
+
+  // Some markets simply aren't addressable on Gamma by condition id, but the CLOB knows them.
+  // Only the ids Gamma missed are retried here, so this can never make pricing worse.
+  const missing = ids.filter(id => !map[id]);
+  let viaClob = 0;
+  if(missing.length){
+    let m = 0;
+    const clobWorker = async () => {
+      while(m < missing.length){
+        throwIfCancelled();
+        const id = missing[m++];
+        try{
+          const url = `https://clob.polymarket.com/markets/${encodeURIComponent(id)}`;
+          const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
+          if(!res.ok) continue;
+          const mk = await res.json();
+          const toks = Array.isArray(mk && mk.tokens) ? mk.tokens : [];
+          if(!toks.length) continue;
+          const closed = !!(mk.closed || mk.archived || toks.some(t => t.winner === true));
+          // settled market: the winning token is worth 1, the rest 0. otherwise use live prices.
+          const prices = toks.map(t => closed && toks.some(x => x.winner === true)
+            ? (t.winner === true ? "1" : "0")
+            : String(t.price != null ? t.price : ""));
+          if(prices.every(p => p === "")) continue;
+          map[id] = { closed, prices, tokens: toks.map(t => String(t.token_id || t.tokenId || "")),
+                      resolveTs: closed ? toTs(mk.end_date_iso || mk.endDateIso || mk.end_date) : 0 };
+          priced++; viaClob++;
+        }catch(e){ /* CLOB unreachable for this id — it stays unpriced, exactly as before */ }
+        setStatus(`Checking how each market resolved… ${ids.length - missing.length + m}/${ids.length}`);
+        await sleep(0);
+      }
+    };
+    await Promise.all(Array.from({length: Math.min(POOL, missing.length)}, clobWorker));
+  }
+
+  map.__priced = priced; map.__requested = ids.length; map.__viaClob = viaClob;
   return map;
 }
 
@@ -885,6 +920,7 @@ function finalize(sim, p, marketMap){
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
     maxDD, fallback, marketsPriced: marketMap.__priced || 0, marketsRequested: marketMap.__requested || 0,
+    marketsViaClob: marketMap.__viaClob || 0,
     topEvent, topShare, top3Share, eventCount: evArr.length, topEvents: evArr.slice(0,3),
     netDecided,
     positions: positions.sort((a,b)=> b.pnl - a.pnl),
@@ -1121,11 +1157,13 @@ function render(r){
     </tr>`).join("");
 
   const parts = [];
-  parts.push(`<b>Data this run:</b> ${r.tradesLoaded} trades, priced ${r.marketsPriced}/${r.marketsRequested} markets. (For two runs to match, these two numbers must match.)`);
+  parts.push(`<b>Data this run:</b> ${r.tradesLoaded} trades, priced ${r.marketsPriced}/${r.marketsRequested} markets`
+    + (r.marketsViaClob ? ` (${r.marketsViaClob} of them via CLOB — Gamma couldn't see those)` : "")
+    + `. (For two runs to match, these two numbers must match.)`);
   if(r.partial)
     parts.push("⚠️ Full history couldn't load this run (the API was slow), so only the most recent ~3000 trades were used. Run again for the complete history — this is why results can differ between runs.");
   if(r.marketsRequested && r.marketsPriced === 0)
-    parts.push("⚠️ Couldn't reach the market-resolution API (Gamma) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
+    parts.push("⚠️ Couldn't reach either market-resolution API (Gamma or CLOB) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
   else if(r.marketsRequested && r.marketsPriced < r.marketsRequested)
     parts.push(`⚠️ Only ${r.marketsPriced} of ${r.marketsRequested} markets could be priced this run; the rest are valued at last traded price. If this count changes between runs, your profit and copied-trade count will change too — re-run until it's stable.`);
   if(r.truncated) parts.push("⚠️ Very active trader: only his most recent 3000 trades were available (API cap), so this covers a shorter period than you selected and may start mid-position.");

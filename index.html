@@ -272,7 +272,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 31</span>
+    <br><span style="opacity:.6">version 32</span>
   </div>
 </div>
 
@@ -488,26 +488,50 @@ async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
     t.eventSlug = intern(t.eventSlug); t.outcome = intern(t.outcome); t.trader = intern(t.trader);
     return t; };
 
-  const out = [];
-  let requests = 0, truncated = false, hitOffsetCap = false;
-  let oldestReached = startedAt;
+  // Each slice gets its OWN fixed budget so where it stops depends only on the data, never on
+  // which slice happened to return first. A shared racing budget made results non-deterministic
+  // and left holes mid-window, which silently corrupted every metric downstream.
+  const PER_SLICE_TRADES = Math.ceil(MAX_TRADES / FETCH_WINDOWS * 1.5);   // headroom for uneven density
+  const PER_SLICE_REQUESTS = Math.ceil(MAX_REQUESTS / FETCH_WINDOWS);
 
-  // Split the window into equal slices and page each one back independently. Slices are
-  // half-open [lo, hi) so a trade can only belong to one of them — no cross-slice duplicates.
+  let requests = 0, fetched = 0, oldestReached = startedAt;
+
+  // Probe once to learn how fast this wallet trades, then only slice up the stretch the budget
+  // can actually cover. Without this, slicing the whole window means the oldest slices fetch
+  // data that gets thrown away when the newest slice runs out of budget first.
+  let effectiveStart = cutoff, narrowed = false;
+  {
+    requests++;
+    const probe = await getJSON(`${API_BASE}/activity?user=${wallet}&type=TRADE&start=${cutoff}`
+      + `&end=${startedAt}&limit=${limit}&offset=0&sortDirection=DESC`, proxy);
+    if(probe.length >= limit){
+      let oldest = startedAt;
+      for(const it of probe){ const ts = num(it.timestamp || it.time || 0); if(ts < oldest) oldest = ts; }
+      const secs = Math.max(1, startedAt - oldest);
+      const perSec = probe.length / secs;                       // trades per second, recently
+      const reach = Math.floor(MAX_TRADES * 0.85 / perSec);     // leave headroom for denser stretches
+      if(reach < span){ effectiveStart = startedAt - reach; narrowed = true; }
+    }
+  }
+  const effSpan = Math.max(1, startedAt - effectiveStart);
+
   const edges = [];
-  for(let i = 0; i <= FETCH_WINDOWS; i++) edges.push(Math.round(cutoff + span * i / FETCH_WINDOWS));
+  for(let i = 0; i <= FETCH_WINDOWS; i++) edges.push(Math.round(effectiveStart + effSpan * i / FETCH_WINDOWS));
+  const buckets = Array.from({length: FETCH_WINDOWS}, () => []);
+  const outcome = new Array(FETCH_WINDOWS);
 
-  const runSlice = async (lo, hi) => {
-    let cursor = hi, offset = 0;
-    let boundaryKeys = new Set();          // only trades sitting exactly on the cursor can repeat
+  const runSlice = async (lo, hi, bucket) => {
+    let cursor = hi, offset = 0, used = 0, reqs = 0;
+    let boundaryKeys = new Set();
     while(cursor > lo){
       throwIfCancelled();
-      if(requests >= MAX_REQUESTS || out.length >= MAX_TRADES){ truncated = true; return; }
-      requests++;
+      if(used >= PER_SLICE_TRADES || reqs >= PER_SLICE_REQUESTS)
+        return {complete:false, stoppedAt:cursor, reason: used >= PER_SLICE_TRADES ? "trades" : "requests"};
+      reqs++; requests++;
       const url = `${API_BASE}/activity?user=${wallet}&type=TRADE&start=${lo}&end=${cursor}`
                 + `&limit=${limit}&offset=${offset}&sortDirection=DESC`;
       const batch = await getJSON(url, proxy);
-      if(batch.length === 0) return;
+      if(batch.length === 0) return {complete:true, stoppedAt:lo};
 
       let oldest = cursor;
       const nextBoundary = new Set();
@@ -515,45 +539,61 @@ async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
         const ts = num(it.timestamp || it.time || 0);
         if(ts < oldest) oldest = ts;
         const key = (it.transactionHash||"") + "|" + (it.asset||"") + "|" + ts + "|" + (it.side||"") + "|" + (it.size||"");
-        if(boundaryKeys.has(key)) continue;                    // already taken at this cursor
-        if(ts >= lo && ts < hi){                               // half-open slice ownership
+        if(boundaryKeys.has(key)) continue;
+        if(ts >= lo && ts < hi){
           const n = compact(normalize(it));
-          if(n && n.size > 0 && n.asset) out.push(n);          // raw object is dropped here
+          if(n && n.size > 0 && n.asset){ bucket.push(n); used++; fetched++; }
         }
         if(ts === oldest) nextBoundary.add(key);
       }
 
       if(oldest < cursor){ cursor = oldest; offset = 0; boundaryKeys = nextBoundary; }
       else {
-        offset += batch.length;                                 // 500+ trades on one second
-        if(offset >= MAX_OFFSET){ hitOffsetCap = true; truncated = true; return; }
+        offset += batch.length;
+        if(offset >= MAX_OFFSET) return {complete:false, stoppedAt:cursor, reason:"timestamp"};
       }
-      if(batch.length < limit && offset === 0) return;
+      if(batch.length < limit && offset === 0) return {complete:true, stoppedAt:lo};
 
       if(cursor < oldestReached) oldestReached = cursor;
       const covered = Math.min(1, (startedAt - oldestReached) / span);
-      setStatus(`Fetching trades… ${out.length.toLocaleString()} so far — back to `
+      setStatus(`Fetching trades… ${fetched.toLocaleString()} so far — back to `
         + new Date(oldestReached*1000).toLocaleDateString(undefined,{day:"numeric",month:"short"})
         + ` (${Math.round(covered*100)}% of the window)`);
       await sleep(0);
     }
+    return {complete:true, stoppedAt:lo};
   };
 
   let nextSlice = 0;
   const worker = async () => {
     while(nextSlice < FETCH_WINDOWS){
       const i = nextSlice++;
-      await runSlice(edges[i], edges[i+1]);
+      outcome[i] = await runSlice(edges[i], edges[i+1], buckets[i]);
     }
   };
   await Promise.all(Array.from({length: FETCH_WINDOWS}, worker));
 
-  const trades = out.filter(t => t.ts >= cutoff).sort((a,b) => a.ts - b.ts);
+  // Assemble newest slice first and cut at the FIRST gap. Whatever is returned is one
+  // continuous stretch ending now — never a sampled set with days missing out of the middle.
+  const out = [];
+  let truncated = narrowed, coverFrom = effectiveStart, stopReason = narrowed ? "trades" : null;
+  for(let i = FETCH_WINDOWS - 1; i >= 0; i--){
+    for(const t of buckets[i]) out.push(t);
+    if(!outcome[i] || !outcome[i].complete){
+      truncated = true;
+      coverFrom = outcome[i] ? outcome[i].stoppedAt : edges[i+1];
+      stopReason = outcome[i] ? outcome[i].reason : "trades";
+      break;                       // everything older than this has a hole — drop it
+    }
+    coverFrom = edges[i];
+  }
+  if(coverFrom < effectiveStart) coverFrom = effectiveStart;
+
+  const trades = out.filter(t => t.ts >= coverFrom).sort((a,b) => a.ts - b.ts);
   const capReason = !truncated ? null
-    : out.length >= MAX_TRADES ? `${MAX_TRADES.toLocaleString()}-trade limit`
-    : requests >= MAX_REQUESTS ? `${MAX_REQUESTS}-request limit`
-    : hitOffsetCap ? "the API's 3,000-per-timestamp limit"
-    : "a data limit";
+    : stopReason === "requests" ? `${MAX_REQUESTS}-request limit`
+    : stopReason === "timestamp" ? "the API's 3,000-per-timestamp limit"
+    : `${MAX_TRADES.toLocaleString()}-trade limit`;
   return { trades, truncated, capReason, coveredFrom: trades.length ? trades[0].ts : cutoff };
 }
 

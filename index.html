@@ -272,7 +272,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 32</span>
+    <br><span style="opacity:.6">version 33</span>
   </div>
 </div>
 
@@ -472,6 +472,31 @@ async function getJSON(url, proxy, tries = 5){
 // a cap this size survivable on a phone.
 const MAX_REQUESTS = 1500, MAX_TRADES = 200000;
 const FETCH_WINDOWS = 6;        // independent cursor chains run in parallel
+
+// Market pricing used a bare fetch with no retry: one transient 429 silently dropped 20
+// markets, and an unpriced market is valued at last-trade instead of its real 0/1 settlement.
+// With ~1,300 requests per run the number lost varied run to run, which moved every figure
+// downstream — including the trader's own P&L, which must never move.
+async function fetchJSONRaw(url, proxy, tries = 4){
+  for(let i = 0; i < tries; i++){
+    throwIfCancelled();
+    let res;
+    try {
+      res = await fetch(proxy ? proxy + encodeURIComponent(url) : url,
+        {headers:{accept:"application/json"}, signal: inflight ? inflight.signal : undefined});
+    } catch(e){
+      if(cancelRun || e.name === "AbortError") throw new Cancelled();
+      if(i === tries-1) return null;
+      await sleep(700*(i+1)); continue;
+    }
+    if(res.ok){ try { return await res.json(); } catch(e){ return null; } }
+    if((res.status === 408 || res.status === 429 || res.status >= 500) && i < tries-1){
+      await sleep(900*(i+1)); continue;                 // rate-limited or a blip — wait and retry
+    }
+    return null;                                        // a real error for this chunk
+  }
+  return null;
+}
 
 async function fetchViaActivity(wallet, cutoff, proxy, endAnchor){
   const limit = 500, MAX_OFFSET = 3000;
@@ -885,7 +910,7 @@ const toTs = v => {                          // ISO string or unix (s/ms) -> uni
 
 async function fetchMarketPrices(conditionIds, proxy){
   const map = {};
-  let priced = 0;
+  let priced = 0, failedChunks = 0;
   const ids = [...new Set(conditionIds)].filter(Boolean);
   const CHUNK = 20;
   // Gamma's `closed` param defaults to false (hides resolved markets), so we query
@@ -893,9 +918,8 @@ async function fetchMarketPrices(conditionIds, proxy){
   const grab = async (chunk, closedFlag) => {
     const qs = chunk.map(id => `condition_ids=${encodeURIComponent(id)}`).join("&");
     const url = `https://gamma-api.polymarket.com/markets?${qs}&limit=${chunk.length}&closed=${closedFlag}`;
-    const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-    if(!res.ok) return;
-    let arr = await res.json();
+    let arr = await fetchJSONRaw(url, proxy);
+    if(arr == null){ failedChunks++; return; }          // exhausted retries — count it, never hide it
     if(!Array.isArray(arr)) arr = arr && arr.data ? arr.data : [];
     for(const m of arr){
       const closed = !!(m.closed || m.umaResolutionStatus === "resolved");
@@ -937,9 +961,8 @@ async function fetchMarketPrices(conditionIds, proxy){
         const id = missing[m++];
         try{
           const url = `https://clob.polymarket.com/markets/${encodeURIComponent(id)}`;
-          const res = await fetch(proxy ? proxy + encodeURIComponent(url) : url, {headers:{accept:"application/json"}});
-          if(!res.ok) continue;
-          const mk = await res.json();
+          const mk = await fetchJSONRaw(url, proxy);
+          if(!mk) continue;
           const toks = Array.isArray(mk && mk.tokens) ? mk.tokens : [];
           if(!toks.length) continue;
           const closed = !!(mk.closed || mk.archived || toks.some(t => t.winner === true));
@@ -960,6 +983,7 @@ async function fetchMarketPrices(conditionIds, proxy){
   }
 
   map.__priced = priced; map.__requested = ids.length; map.__viaClob = viaClob;
+  map.__failedChunks = failedChunks;
   return map;
 }
 
@@ -1033,6 +1057,7 @@ function finalize(sim, p, marketMap){
     netPnl: endingEquity - sim.startBankroll, roi: (endingEquity - sim.startBankroll)/sim.startBankroll,
     copied: sim.copied, skipped: sim.skipped, capped: sim.capped, noHold: sim.noHold,
     budgetCapped: sim.budgetCapped,
+    pricingFailures: marketMap.__failedChunks || 0,
     fees: sim.fees, slip: sim.slip, costDrag: sim.fees + sim.slip,
     positionsTraded: positions.length, decided: decided.length, openCount: positions.length - decided.length,
     wins: winners.length, losses: losers.length, winRate, avgWin, avgLoss, profitFactor, expectancy,
@@ -1288,6 +1313,8 @@ function render(r){
     parts.push("⚠️ Full history couldn't load this run (the API was slow), so only the most recent ~3000 trades were used. Run again for the complete history — this is why results can differ between runs.");
   if(r.marketsRequested && r.marketsPriced === 0)
     parts.push("⚠️ Couldn't reach either market-resolution API (Gamma or CLOB) from your browser, so win/loss can't be determined and positions are valued at last traded price. Try adding a CORS proxy in Advanced settings.");
+  else if(r.pricingFailures)
+    parts.push(`⚠️ ${r.pricingFailures} pricing request(s) failed even after retries, so ${r.marketsRequested - r.marketsPriced} market(s) are valued at last traded price instead of their settlement. <b>Re-run before trusting these numbers</b> — a different number of failures gives a different result.`);
   else if(r.marketsRequested && r.marketsPriced < r.marketsRequested)
     parts.push(`⚠️ Only ${r.marketsPriced} of ${r.marketsRequested} markets could be priced this run; the rest are valued at last traded price. If this count changes between runs, your profit and copied-trade count will change too — re-run until it's stable.`);
   if(r.truncated) parts.push(`⚠️ Very active trader: the fetch stopped at the ${r.capReason || "data limit"}`

@@ -272,7 +272,7 @@
   <div class="foot">
     Educational backtest — past performance is not a guarantee. Open positions are marked at the
     last price seen in the window, not at market resolution. Data: Polymarket public data API.
-    <br><span style="opacity:.6">version 30</span>
+    <br><span style="opacity:.6">version 31</span>
   </div>
 </div>
 
@@ -376,7 +376,8 @@ async function run(){
     setStatus(`Loaded ${trades.length} trades${who ? ` from ${who}` : ""}. Checking how each market resolved…`);
     const condIds = [...new Set(trades.map(t => t.conditionId))];
     const marketMap = await fetchMarketPrices(condIds, params.proxy);
-    setStatus("Running simulation…");
+    setStatus(`Running simulation on ${trades.length.toLocaleString()} trades…`);
+    await sleep(0);                       // paint the message before the synchronous work begins
     const res = analyze(trades, marketMap, params);
     res.truncated = truncated;
     res.partial = partial;
@@ -731,11 +732,11 @@ function simulate(trades, p, marketMap){
   events.sort((a,b) => (a.ts - b.ts) || ((a._type==="TRADE"?0:1) - (b._type==="TRADE"?0:1)));
 
   const curve = [{ts: (events[0]?events[0].ts:0) - 1, equity: p.bankroll}];
-  const markEquity = () => {
-    let v = cash;
-    for(const a in pos) v += pos[a].shares * pos[a].last;
-    return v;
-  };
+  // Mark-to-market value of open positions, kept as a running total. Re-summing every position
+  // after every trade is O(positions) per trade — quadratic, and fatal on wallets with thousands
+  // of markets. Same arithmetic (cash + Σ shares×last), just maintained instead of recomputed.
+  let openMark = 0;
+  const markEquity = () => cash + openMark;
 
   for(const ev of events){
     if(ev._type === "RESOLVE"){
@@ -749,6 +750,7 @@ function simulate(trades, p, marketMap){
         const settlePnl = credit - ps.basis;                          // result of this settlement vs cost of held shares
         if(settlePnl > 1e-9) ps.wTrades++; else if(settlePnl < -1e-9) ps.lTrades++;
         cash += credit; ps.returned += credit; ps.settled = true; settledCount++;
+        openMark -= ps.shares * ps.last;                 // position is closing out
         log.push({ts:ev.ts, side:"RESOLVE", title:ps.title, outcome:ps.outcome,
                   shares:ps.shares, price:(isFinite(payout)?payout:0), value:credit, pnl: ps.returned - ps.invested});
         ps.shares = 0; ps.basis = 0;
@@ -762,6 +764,7 @@ function simulate(trades, p, marketMap){
       title:tr.title, eventSlug:tr.eventSlug, outcome:tr.outcome, shares:0, basis:0, last:tr.price,
       invested:0, returned:0, bought:0, buys:0, sells:0, wTrades:0, lTrades:0, firstTs:tr.ts, lastTs:tr.ts};
     const ps = pos[a];
+    openMark += ps.shares * (tr.price - ps.last);        // re-mark what we already hold
     ps.last = tr.price;
     if(tr.ts < ps.firstTs) ps.firstTs = tr.ts;
     if(tr.ts > ps.lastTs) ps.lastTs = tr.ts;
@@ -792,6 +795,7 @@ function simulate(trades, p, marketMap){
       cash -= cost + fee;
       if(fixedMode) spentByMkt[tr.conditionId] = (spentByMkt[tr.conditionId] || 0) + cost + fee;
       ps.shares += shares; ps.basis += cost + fee; ps.invested += cost + fee; ps.bought += shares; ps.buys++;
+      openMark += shares * ps.last;
       fees += fee; slip += shares * (fill - tr.price);
       traderShares[a] = (traderShares[a]||0) + tr.size;
       copied++;
@@ -815,6 +819,7 @@ function simulate(trades, p, marketMap){
       cash += proceeds - fee;
       if(fixedMode) spentByMkt[tr.conditionId] = 0;          // any sell (partial or full) re-arms the full amount
       ps.shares -= sellShares; ps.basis -= costPortion; ps.returned += proceeds - fee; ps.sells++;
+      openMark -= sellShares * ps.last;
       fees += fee; slip += sellShares * (tr.price - fill);
       traderShares[a] = Math.max(0, before - tr.size);
       copied++;
